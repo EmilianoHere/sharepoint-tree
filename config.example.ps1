@@ -46,6 +46,11 @@ $SPOArgs = @{
     # min; esto es más pesado). Subilo con cautela.
     DeepVersionTopN = 30
 
+    # ArchiveMonths: umbral de inactividad (en meses) para marcar un sitio como
+    # candidato a Microsoft 365 Archive. Un sitio sin cambios por más de este tiempo
+    # se cuenta como candidato en el resumen (y en candidatos_archive.csv).
+    ArchiveMonths   = 6
+
     # =========================================================================
     # Autenticación: dejar activa UNA sola opción.
     #

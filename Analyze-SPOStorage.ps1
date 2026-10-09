@@ -49,8 +49,8 @@ param(
     # Tamaño mínimo de carpeta (en GB) para que aparezca en carpetas.csv.
     [double]$MinFolderSizeGB = 1.0,
 
-    # Umbral de inactividad (meses) para candidatos a archive. Se evalúan 6 y 12.
-    [int]$ArchiveMonths = 12,
+    # Umbral de inactividad (meses) para contar candidatos a archive en el resumen.
+    [int]$ArchiveMonths = 6,
 
     # Cantidad de filas a mostrar en los rankings de consola (sitios y carpetas).
     # Solo afecta la salida en pantalla; los CSV siguen con todas las filas.
@@ -946,7 +946,8 @@ function Get-SiteShortName {
     param([string]$SiteUrl)
     try {
         $abs = (New-Object System.Uri $SiteUrl).AbsolutePath.Trim('/')
-        if ([string]::IsNullOrWhiteSpace($abs)) { return $SiteUrl }  # Sitio raíz: URL completa.
+        # Sitio raíz (sin segmento de ruta): etiqueta corta en vez de la URL completa.
+        if ([string]::IsNullOrWhiteSpace($abs)) { return '/ (raíz)' }
         return ($abs -split '/')[-1]
     }
     catch {
@@ -955,10 +956,17 @@ function Get-SiteShortName {
 }
 
 # Arma la etiqueta legible de una fila de carpeta: "[sitio] Biblioteca/CarpetaPath".
+# Normaliza el separador: FolderPath a veces viene con '/' inicial y a veces sin él,
+# por eso lo recortamos y unimos con una sola barra (evita "DocumentosDocumentos...").
 function Format-FolderLabel {
     param([object]$Folder)
     $short = Get-SiteShortName $Folder.SiteUrl
-    return ("[{0}] {1}{2}" -f $short, $Folder.Library, $Folder.FolderPath)
+    $path  = [string]$Folder.FolderPath
+    $path  = $path.TrimStart('/')  # quitar barra inicial si la hubiera
+    if ([string]::IsNullOrWhiteSpace($path)) {
+        return ("[{0}] {1}" -f $short, $Folder.Library)
+    }
+    return ("[{0}] {1}/{2}" -f $short, $Folder.Library, $path)
 }
 
 function Show-Summary {
@@ -974,7 +982,9 @@ function Show-Summary {
         # Antigüedad (meses) usada como criterio de "recuperable" en el análisis profundo.
         [int]$VersionAgeMonths = 2,
         # Desglose de antigüedad de versiones por carpeta (Get-FolderVersionAgeBreakdown).
-        [object[]]$VersionBreakdowns = @()
+        [object[]]$VersionBreakdowns = @(),
+        # Umbral de inactividad (meses) para contar candidatos a archivar en el resumen.
+        [int]$ArchiveMonths = 6
     )
 
     $line = ('=' * 72)
@@ -1060,14 +1070,15 @@ function Show-Summary {
     $binBytes = [double]($binBytes ?? 0)
     Write-Host ("`nRecuperable en papeleras (1ra+2da etapa): {0} GB" -f (ConvertTo-GB $binBytes)) -ForegroundColor Green
 
-    # Candidatos a archivar.
-    $cand12 = $Candidates | Where-Object { $_.Inactive12Months }
-    $candBytes = ($cand12 | Measure-Object -Property StorageUsageBytes -Sum).Sum
+    # Candidatos a archivar: sitios sin cambios en los últimos $ArchiveMonths meses.
+    # Filtramos por MonthsIdle (numérico) para soportar cualquier umbral configurable.
+    $cand = $Candidates | Where-Object { $_.MonthsIdle -ge $ArchiveMonths }
+    $candBytes = ($cand | Measure-Object -Property StorageUsageBytes -Sum).Sum
     $candBytes = [double]($candBytes ?? 0)
     $candGB = ConvertTo-GB $candBytes
 
-    Write-Host "`n--- Candidatos a Microsoft 365 Archive (sin cambios 12+ meses) ---" -ForegroundColor Yellow
-    Write-Host ("  Sitios candidatos: {0}" -f @($cand12).Count)
+    Write-Host ("`n--- Candidatos a Microsoft 365 Archive (sin cambios {0}+ meses) ---" -f $ArchiveMonths) -ForegroundColor Yellow
+    Write-Host ("  Sitios candidatos: {0}" -f @($cand).Count)
     Write-Host ("  Tamaño total candidato: {0} GB" -f $candGB)
 
     # Costos comparativos.
@@ -1274,7 +1285,7 @@ function Main {
     Show-Summary -Sites $sites -Folders $foldersArr -Candidates $candidates `
         -Bins $allBins.ToArray() -TotalUsedBytes $totalUsedBytes -TotalQuotaBytes $totalQuotaBytes `
         -TopRankings $TopRankings -VersionAgeMonths $VersionAgeMonths `
-        -VersionBreakdowns $versionBreakdowns.ToArray()
+        -VersionBreakdowns $versionBreakdowns.ToArray() -ArchiveMonths $ArchiveMonths
 
     $swTotal.Stop()
     Write-Log ("Listo en {0:mm\:ss}. CSVs en: $OutputPath" -f $swTotal.Elapsed) 'OK'

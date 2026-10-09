@@ -1,0 +1,21 @@
+# Configuración local con credenciales (NUNCA commitear)
+config.ps1
+
+# Certificados
+*.pfx
+*.pem
+*.cer
+*.key
+
+# Salida del análisis
+salida/
+*.csv
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# PowerShell
+*.psd1.bak

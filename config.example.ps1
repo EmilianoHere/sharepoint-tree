@@ -31,6 +31,21 @@ $SPOArgs = @{
     TopN            = 20
     MinFolderSizeGB = 1.0
 
+    # Cantidad de filas en los rankings de CONSOLA (sitios y carpetas). Solo afecta
+    # la salida en pantalla; los CSV siempre llevan todas las filas.
+    TopRankings     = 30
+
+    # VersionAgeMonths: una versión histórica más vieja que estos meses se considera
+    # "recuperable" (criterio del usuario). Las más nuevas no se cuentan como ahorro.
+    VersionAgeMonths = 2
+
+    # DeepVersionTopN: cantidad de carpetas (las de mayor overhead) sobre las que se
+    # corre el análisis PROFUNDO de antigüedad de versiones, archivo por archivo.
+    # CUIDADO PERFORMANCE: ese análisis lee el historial de versiones de CADA archivo
+    # inmediato y es MUY lento (el relevamiento de carpetas de 3 sitios ya tardó ~57
+    # min; esto es más pesado). Subilo con cautela.
+    DeepVersionTopN = 30
+
     # =========================================================================
     # Autenticación: dejar activa UNA sola opción.
     #

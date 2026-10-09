@@ -19,3 +19,6 @@ salida/
 
 # PowerShell
 *.psd1.bak
+
+# Artefactos internos de workflows/agentes (no son parte del proyecto)
+.agents/

@@ -179,6 +179,9 @@ tiene acceso y es lento. No recomendado para auditar todo el tenant (ver tabla a
 | `-TopN` | `20` | Cantidad de sitios (los más pesados) a analizar en detalle. |
 | `-MinFolderSizeGB` | `1.0` | Tamaño mínimo de carpeta (GB) para aparecer en `carpetas.csv`. |
 | `-ArchiveMonths` | `12` | Umbral de inactividad para candidatos (se evalúan 6 y 12 meses). |
+| `-TopRankings` | `30` | Cantidad de filas a mostrar en los rankings de **consola** (sitios y carpetas). No afecta los CSV, que siempre llevan todas las filas. |
+| `-VersionAgeMonths` | `2` | Antigüedad (meses) a partir de la cual una versión histórica se considera **recuperable**. Las más nuevas no se cuentan como ahorro. |
+| `-DeepVersionTopN` | `30` | Cantidad de carpetas (las de mayor overhead) sobre las que se corre el **análisis profundo** de antigüedad de versiones (archivo por archivo). **Es lento** (ver notas). |
 | `-Interactive` | — | Login interactivo en navegador. |
 | `-Thumbprint` | — | Thumbprint del certificado instalado. |
 | `-CertificatePath` | — | Ruta a un `.pfx`. |
@@ -194,17 +197,31 @@ Se generan en `-OutputPath` (tamaños en **GB con 2 decimales**):
 - **`bibliotecas.csv`** — por biblioteca: tamaño total, versión actual, overhead por
   versiones, cantidad de archivos y configuración de versionado (`MajorVersionLimit`, etc.).
 - **`carpetas.csv`** — carpetas recursivas (hasta `MaxDepth`) con `TotalSize`,
-  `TotalFileStream`, `VersionOverhead`, `TotalFileCount` y `LastModified`.
+  `OwnSize` (tamaño **propio/exclusivo**, sin subcarpetas), `TotalFileStream`,
+  `VersionOverhead`, `TotalFileCount` y `LastModified`.
 - **`papeleras.csv`** — papelera de 1ra y 2da etapa + Preservation Hold Library por sitio.
 - **`candidatos_archive.csv`** — sitios sin cambios en 6/12 meses.
+- **`versiones_antiguas.csv`** — resultado del análisis profundo de antigüedad de versiones
+  sobre las `DeepVersionTopN` carpetas con más overhead: por carpeta trae
+  `FilesAnalyzed`, `VersionsAnalyzed`, `RecentVersionsGB` (versiones recientes, NO
+  recuperables), `RecoverableVersionsGB` (versiones de más de `VersionAgeMonths` meses),
+  los buckets `Bucket_2to6mGB` / `Bucket_6to12mGB` / `Bucket_over12mGB` y
+  `TotalVersionOverheadGB` (overhead de la métrica de carpeta, para cross-check).
 
 Además, un **resumen en consola** con:
 
-- Top 10 carpetas más pesadas.
-- Top 10 carpetas por `VersionOverhead`.
-- Recuperable estimado por versiones y por papeleras.
+- Top `TopRankings` **sitios** por tamaño.
+- Top `TopRankings` **carpetas por tamaño TOTAL** (acumulado, incluye subcarpetas).
+- Top `TopRankings` **carpetas por tamaño PROPIO** (exclusivo, sin subcarpetas).
+- Top `TopRankings` **carpetas por `VersionOverhead`**.
+- Overhead **total** de versiones (todas las edades) y recuperable **por versiones de
+  más de `VersionAgeMonths` meses** (con desglose por antigüedad), más lo recuperable en papeleras.
 - Total de sitios candidatos a archivar y su tamaño.
 - Costo mensual estimado: **Archive (US$0.05/GB)** vs **Extra Storage (US$0.20/GB)**.
+
+Cada fila de carpeta en los rankings de consola lleva una etiqueta `[sitio] Biblioteca/Carpeta`
+para distinguir bibliotecas **homónimas** que viven en sitios distintos (p. ej. dos
+"Documentos compartidos", una en `/sites/...` y otra en el sitio raíz `/`).
 
 ---
 
@@ -219,6 +236,28 @@ Además, un **resumen en consola** con:
   resumen suma **solo las filas raíz por biblioteca** (`Depth = 0`) para no contar el
   mismo overhead varias veces. Los dos "Top 10" de `carpetas.csv` siguen mostrando
   carpetas de cualquier profundidad: son un **drill-down informativo**, no un agregado.
+- **Dos vistas de tamaño de carpeta (total vs propio).** Como las métricas son
+  **acumuladas** (una carpeta padre incluye todo su árbol), el ranking por **tamaño TOTAL**
+  muestra la **misma rama a cada nivel de anidación** (p. ej. `/Documentos compartidos`,
+  `.../productos`, `.../productos/003. Informática` son la misma rama contada tres veces).
+  Por eso se agrega una vista por **tamaño PROPIO (exclusivo)**: para cada carpeta se resta
+  la suma del `TotalSize` de sus carpetas **hijas directas**, de modo que cada carpeta
+  cuenta solo lo suyo. El valor se clampa en 0 (nunca negativo) y queda en la columna
+  `OwnSize` de `carpetas.csv`.
+  > Limitación: si una carpeta hija quedó por debajo de `MinFolderSizeGB` no fue relevada,
+  > así que su tamaño no se puede restar y el tamaño propio del padre queda **aproximado
+  > (sobreestimado)** en ese caso.
+- **Análisis de antigüedad de versiones (lento, acotado, LOWER BOUND).** `Get-PnPFolderStorageMetric`
+  da el overhead **total** de versiones pero NO su antigüedad. Para saber cuánto overhead
+  corresponde a versiones de más de `VersionAgeMonths` meses hay que bajar a nivel **archivo**
+  y leer el historial de versiones de cada uno (`Get-PnPFileVersion`), lo cual es **muy costoso**.
+  Por eso solo se corre sobre las **`DeepVersionTopN` carpetas con más overhead** y únicamente
+  sobre sus **archivos inmediatos** (no se recursa en subcarpetas; recursar multiplica el
+  costo de forma brutal en carpetas con decenas de miles de archivos). Cada versión histórica
+  se clasifica por antigüedad en buckets **2-6m / 6-12m / >12m**; las de hasta `VersionAgeMonths`
+  meses se marcan como recientes (no recuperables). El total recuperable que surge de aquí es
+  un **límite inferior**: solo cubre las carpetas más pesadas drilleadas y sus archivos directos.
+  El script **solo REPORTA** este espacio recuperable: **nunca borra versiones ni nada**.
 - La **cuota del pool** mostrada es aproximada (suma de cuotas por sitio). Si conocés el
   valor real del pool de tu tenant (ej. 3.36 TB), tomalo del Admin Center de SharePoint
   (Settings → Storage) para comparar contra el uso total que reporta el script.

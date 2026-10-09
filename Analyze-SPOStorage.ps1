@@ -52,6 +52,20 @@ param(
     # Umbral de inactividad (meses) para candidatos a archive. Se evalúan 6 y 12.
     [int]$ArchiveMonths = 12,
 
+    # Cantidad de filas a mostrar en los rankings de consola (sitios y carpetas).
+    # Solo afecta la salida en pantalla; los CSV siguen con todas las filas.
+    [int]$TopRankings = 30,
+
+    # Antigüedad (en meses) a partir de la cual una versión histórica se considera
+    # "recuperable" según el criterio del usuario (versiones más viejas que esto).
+    [int]$VersionAgeMonths = 2,
+
+    # Cantidad de carpetas (las de mayor VersionOverhead) sobre las que se hace el
+    # análisis PROFUNDO de antigüedad de versiones (archivo por archivo).
+    # CUIDADO: ese análisis lee el historial de versiones de CADA archivo y es MUY
+    # costoso/lento; por eso se limita a estas Top N carpetas por overhead.
+    [int]$DeepVersionTopN = 30,
+
     # --- Autenticación: elegir UNA de estas opciones ---
 
     # Login interactivo en el navegador (cómodo para una corrida puntual).
@@ -458,6 +472,222 @@ function Get-FolderMetricsRecursive {
 }
 
 # ---------------------------------------------------------------------------
+# Tamaño PROPIO (exclusivo) de cada carpeta
+# ---------------------------------------------------------------------------
+
+<#
+.SYNOPSIS
+    Calcula el tamaño PROPIO (exclusivo) de cada carpeta y lo agrega como OwnSizeBytes.
+.DESCRIPTION
+    Get-PnPFolderStorageMetric devuelve TotalSize ACUMULADO (la carpeta incluye todas
+    sus subcarpetas), por eso el ranking por tamaño total muestra el mismo árbol a cada
+    nivel de anidación. El tamaño PROPIO de una carpeta = su TotalSize menos la suma del
+    TotalSize de sus carpetas HIJAS DIRECTAS (misma SiteUrl + Library, cuyo FolderPath es
+    exactamente el de la carpeta + un segmento más). Se clampa en 0 (nunca negativo).
+
+    LIMITACIÓN: si una carpeta hija cayó por debajo de MinFolderSizeGB no está en la
+    lista relevada, así que su tamaño no se puede restar y el tamaño propio queda
+    SOBREESTIMADO (aproximado) en ese caso.
+
+    Devuelve la MISMA lista de objetos con una propiedad OwnSizeBytes agregada.
+#>
+function Add-OwnFolderSize {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Folders
+    )
+
+    # Índice por clave "SiteUrl|Library|FolderPath normalizado" para ubicar padres/hijas.
+    # Normalizamos el path quitando una barra inicial/final para comparar segmentos.
+    function Get-NormPath { param([string]$p) return $p.Trim('/') }
+
+    # Agrupar por SiteUrl+Library para que la relación padre/hija sea dentro del mismo árbol.
+    $byTree = @{}
+    foreach ($f in $Folders) {
+        $key = "$($f.SiteUrl)|$($f.Library)"
+        if (-not $byTree.ContainsKey($key)) { $byTree[$key] = [System.Collections.Generic.List[object]]::new() }
+        $byTree[$key].Add($f)
+    }
+
+    foreach ($f in $Folders) {
+        $norm = Get-NormPath $f.FolderPath
+        $siblings = $byTree["$($f.SiteUrl)|$($f.Library)"]
+
+        # Hijas DIRECTAS: su path normalizado empieza con "$norm/" y no tiene más
+        # segmentos adicionales (exactamente un nivel por debajo).
+        $childSum = 0.0
+        foreach ($cand in $siblings) {
+            if ([object]::ReferenceEquals($cand, $f)) { continue }
+            $cnorm = Get-NormPath $cand.FolderPath
+            # El prefijo de carpeta vacío (raíz "") requiere un manejo distinto.
+            if ($norm -eq '') {
+                # La raíz: hija directa = un único segmento, sin barras internas.
+                if ($cnorm -ne '' -and $cnorm -notmatch '/') { $childSum += [double]$cand.TotalSizeBytes }
+            }
+            else {
+                if ($cnorm.StartsWith("$norm/")) {
+                    $rest = $cnorm.Substring($norm.Length + 1)
+                    if ($rest -ne '' -and $rest -notmatch '/') { $childSum += [double]$cand.TotalSizeBytes }
+                }
+            }
+        }
+
+        $own = [double]$f.TotalSizeBytes - $childSum
+        if ($own -lt 0) { $own = 0.0 }  # Clamp: nunca negativo (ver limitación en el header).
+        $f | Add-Member -NotePropertyName OwnSizeBytes -NotePropertyValue $own -Force
+    }
+
+    return $Folders
+}
+
+# ---------------------------------------------------------------------------
+# Análisis profundo de antigüedad de versiones (archivo por archivo)
+# ---------------------------------------------------------------------------
+
+<#
+.SYNOPSIS
+    Clasifica el overhead de versiones de una carpeta por ANTIGÜEDAD de cada versión.
+.DESCRIPTION
+    Get-PnPFolderStorageMetric da el overhead TOTAL de versiones pero NO su antigüedad.
+    Para saber cuánto overhead corresponde a versiones más viejas que N meses hay que
+    bajar a nivel ARCHIVO y leer el historial de versiones de cada uno. Es MUY costoso,
+    por eso solo se corre sobre las Top N carpetas por overhead (ver DeepVersionTopN).
+
+    DECISIÓN DOCUMENTADA (recursión): se analizan SOLO los archivos INMEDIATOS de la
+    carpeta (NO se baja a subcarpetas). Motivo: recursar multiplica el costo de forma
+    brutal (una carpeta tenía 88.499 archivos) y el riesgo de runtime es alto. Además,
+    la vista de "tamaño propio" (exclusivo) de la Feature 1 combina justo con esto:
+    cada carpeta aporta sus archivos inmediatos, sin solaparse con las hijas. La
+    implicancia es que el overhead por antigüedad reportado para una carpeta cubre sus
+    archivos directos; las subcarpetas pesadas aparecen como sus propias filas si están
+    dentro del Top N por overhead.
+
+    PROPIEDADES usadas del objeto de versión (Microsoft.SharePoint.Client.FileVersion,
+    PnP.PowerShell 3.4.1, confirmadas por reflexión del tipo CSOM):
+      - Length  (Int64)   -> tamaño en bytes de esa versión (se prefiere sobre Size,
+                             que es Int32 y puede desbordar en archivos grandes).
+      - Created (DateTime) -> fecha de creación de la versión (para la antigüedad).
+      - IsCurrentVersion (Boolean) -> se excluye la versión viva (defensivo; además
+                             Get-PnPFileVersion ya devuelve solo versiones históricas).
+
+    Devuelve un objeto con los bytes recientes vs recuperables y los buckets de edad.
+#>
+function Get-FolderVersionAgeBreakdown {
+    param(
+        [Parameter(Mandatory = $true)][object]$Connection,
+        [Parameter(Mandatory = $true)][string]$SiteUrl,
+        [Parameter(Mandatory = $true)][string]$Library,
+        [Parameter(Mandatory = $true)][string]$FolderSiteRelativeUrl,
+        [int]$VersionAgeMonths = 2,
+        [int]$FolderIndex = 0,
+        [int]$FolderTotal = 0
+    )
+
+    $now = Get-Date
+    $cutoffRecoverable = $now.AddMonths(-$VersionAgeMonths)  # Más viejo que esto = recuperable.
+    $cutoff6  = $now.AddMonths(-6)
+    $cutoff12 = $now.AddMonths(-12)
+
+    # Acumuladores (bytes).
+    $recentBytes      = 0.0   # Versiones <= N meses (NO recuperable).
+    $recoverableBytes = 0.0   # Versiones > N meses (recuperable, suma de los buckets).
+    $bucket2to6       = 0.0
+    $bucket6to12      = 0.0
+    $bucketOver12     = 0.0
+    $filesAnalyzed    = 0
+    $versionsAnalyzed = 0
+
+    # Listar SOLO los archivos inmediatos de la carpeta (sin recursar).
+    $files = @()
+    try {
+        $files = Invoke-WithRetry -Context "listar archivos $FolderSiteRelativeUrl" -ArgumentList @($Connection, $FolderSiteRelativeUrl) -ScriptBlock {
+            param($conn, $rel)
+            Get-PnPFolderItem -Connection $conn -FolderSiteRelativeUrl $rel -ItemType File
+        }
+    }
+    catch {
+        Write-Log "No se pudieron listar archivos de '$FolderSiteRelativeUrl': $($_.Exception.Message)" 'WARN'
+        $files = @()
+    }
+
+    $fileTotal = @($files).Count
+    $fi = 0
+    foreach ($file in $files) {
+        $fi++
+        # Progreso dentro de la carpeta (barra anidada).
+        if ($fileTotal -gt 0) {
+            Write-Progress -Id 2 -ParentId 1 -Activity "Analizando versiones (carpeta $FolderIndex/$FolderTotal)" `
+                -Status "archivo $fi/$fileTotal" -PercentComplete ([int](($fi / $fileTotal) * 100))
+        }
+
+        $fileUrl = $file.ServerRelativeUrl
+        if ([string]::IsNullOrWhiteSpace($fileUrl)) { continue }
+
+        # Leer el historial de versiones del archivo (envuelto en reintentos por throttling).
+        $versions = @()
+        try {
+            $versions = Invoke-WithRetry -Context "versiones de $fileUrl" -ArgumentList @($Connection, $fileUrl) -ScriptBlock {
+                param($conn, $url)
+                Get-PnPFileVersion -Connection $conn -Url $url
+            }
+        }
+        catch {
+            Write-Log "No se pudieron leer versiones de '$fileUrl': $($_.Exception.Message)" 'WARN'
+            continue
+        }
+
+        $filesAnalyzed++
+
+        foreach ($v in $versions) {
+            # Excluir la versión viva por si apareciera (defensivo).
+            if ($v.PSObject.Properties['IsCurrentVersion'] -and $v.IsCurrentVersion) { continue }
+
+            # Tamaño: preferimos Length (Int64); si no está, caemos a Size.
+            $vBytes = 0.0
+            if ($v.PSObject.Properties['Length'] -and $v.Length) { $vBytes = [double]$v.Length }
+            elseif ($v.PSObject.Properties['Size'] -and $v.Size) { $vBytes = [double]$v.Size }
+
+            $created = $null
+            if ($v.PSObject.Properties['Created']) { $created = $v.Created }
+
+            $versionsAnalyzed++
+
+            # Sin fecha usable no podemos clasificar por antigüedad: lo contamos como
+            # reciente (criterio conservador: no lo marcamos como recuperable).
+            if (-not $created -or ($created -is [datetime] -and $created -eq [datetime]::MinValue)) {
+                $recentBytes += $vBytes
+                continue
+            }
+
+            if ($created -gt $cutoffRecoverable) {
+                # Reciente: no recuperable según el criterio del usuario.
+                $recentBytes += $vBytes
+            }
+            else {
+                # Recuperable (más viejo que N meses). Lo clasificamos en un bucket.
+                $recoverableBytes += $vBytes
+                if ($created -gt $cutoff6) { $bucket2to6 += $vBytes }
+                elseif ($created -gt $cutoff12) { $bucket6to12 += $vBytes }
+                else { $bucketOver12 += $vBytes }
+            }
+        }
+    }
+    Write-Progress -Id 2 -ParentId 1 -Completed
+
+    return [pscustomobject]@{
+        SiteUrl              = $SiteUrl
+        Library             = $Library
+        FolderPath          = $FolderSiteRelativeUrl
+        FilesAnalyzed       = $filesAnalyzed
+        VersionsAnalyzed    = $versionsAnalyzed
+        RecentVersionsBytes = $recentBytes
+        RecoverableVersionsBytes = $recoverableBytes
+        Bucket2to6Bytes     = $bucket2to6
+        Bucket6to12Bytes    = $bucket6to12
+        BucketOver12Bytes   = $bucketOver12
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Preservation Hold Library
 # ---------------------------------------------------------------------------
 
@@ -646,13 +876,32 @@ function Export-LibrariesCsv {
 # Exporta carpetas.csv.
 function Export-FoldersCsv {
     param([object[]]$Folders, [string]$Path)
+    # OwnSizeGB = tamaño PROPIO (exclusivo, sin subcarpetas). Si la carpeta no tiene
+    # OwnSizeBytes calculado, caemos al TotalSize (no debería pasar: Main lo calcula antes).
     $rows = $Folders | Sort-Object TotalSizeBytes -Descending | Select-Object `
         SiteUrl, Library, FolderPath, Depth, `
         @{ N = 'TotalSizeGB'; E = { ConvertTo-GB $_.TotalSizeBytes } }, `
+        @{ N = 'OwnSizeGB'; E = { ConvertTo-GB ($_.PSObject.Properties['OwnSizeBytes'] ? $_.OwnSizeBytes : $_.TotalSizeBytes) } }, `
         @{ N = 'TotalFileStreamGB'; E = { ConvertTo-GB $_.TotalFileStreamBytes } }, `
         @{ N = 'VersionOverheadGB'; E = { ConvertTo-GB $_.VersionOverheadBytes } }, `
         TotalFileCount, LastModified
     $rows | Export-Csv -Path (Join-Path $Path 'carpetas.csv') -Encoding UTF8
+}
+
+# Exporta versiones_antiguas.csv (resultado del análisis profundo de antigüedad).
+function Export-OldVersionsCsv {
+    param([object[]]$Breakdowns, [string]$Path)
+    # TotalVersionOverheadGB se toma de la métrica de carpeta (cross-check contra la
+    # suma de versiones reciente + recuperable que relevó el análisis profundo).
+    $rows = $Breakdowns | Sort-Object RecoverableVersionsBytes -Descending | Select-Object `
+        SiteUrl, Library, FolderPath, FilesAnalyzed, VersionsAnalyzed, `
+        @{ N = 'RecentVersionsGB'; E = { ConvertTo-GB $_.RecentVersionsBytes } }, `
+        @{ N = 'RecoverableVersionsGB'; E = { ConvertTo-GB $_.RecoverableVersionsBytes } }, `
+        @{ N = 'Bucket_2to6mGB'; E = { ConvertTo-GB $_.Bucket2to6Bytes } }, `
+        @{ N = 'Bucket_6to12mGB'; E = { ConvertTo-GB $_.Bucket6to12Bytes } }, `
+        @{ N = 'Bucket_over12mGB'; E = { ConvertTo-GB $_.BucketOver12Bytes } }, `
+        @{ N = 'TotalVersionOverheadGB'; E = { ConvertTo-GB $_.FolderVersionOverheadBytes } }
+    $rows | Export-Csv -Path (Join-Path $Path 'versiones_antiguas.csv') -Encoding UTF8
 }
 
 # Exporta papeleras.csv (incluye PHL como filas adicionales informativas).
@@ -690,6 +939,28 @@ function Export-ArchiveCandidatesCsv {
 # Resumen en consola
 # ---------------------------------------------------------------------------
 
+# Devuelve el nombre corto de un sitio: último segmento de la URL (o la URL
+# completa si es el sitio raíz). Sirve para distinguir dos bibliotecas homónimas
+# que viven en sitios distintos (ej. "Documentos compartidos" en /sites/X y en /).
+function Get-SiteShortName {
+    param([string]$SiteUrl)
+    try {
+        $abs = (New-Object System.Uri $SiteUrl).AbsolutePath.Trim('/')
+        if ([string]::IsNullOrWhiteSpace($abs)) { return $SiteUrl }  # Sitio raíz: URL completa.
+        return ($abs -split '/')[-1]
+    }
+    catch {
+        return $SiteUrl
+    }
+}
+
+# Arma la etiqueta legible de una fila de carpeta: "[sitio] Biblioteca/CarpetaPath".
+function Format-FolderLabel {
+    param([object]$Folder)
+    $short = Get-SiteShortName $Folder.SiteUrl
+    return ("[{0}] {1}{2}" -f $short, $Folder.Library, $Folder.FolderPath)
+}
+
 function Show-Summary {
     param(
         [object[]]$Sites,
@@ -697,7 +968,13 @@ function Show-Summary {
         [object[]]$Candidates,
         [object[]]$Bins,
         [double]$TotalUsedBytes,
-        [double]$TotalQuotaBytes
+        [double]$TotalQuotaBytes,
+        # Cantidad de filas a mostrar en cada ranking de consola.
+        [int]$TopRankings = 30,
+        # Antigüedad (meses) usada como criterio de "recuperable" en el análisis profundo.
+        [int]$VersionAgeMonths = 2,
+        # Desglose de antigüedad de versiones por carpeta (Get-FolderVersionAgeBreakdown).
+        [object[]]$VersionBreakdowns = @()
     )
 
     $line = ('=' * 72)
@@ -711,20 +988,37 @@ function Show-Summary {
         Write-Host ("Cuota del pool (aprox): {0} GB  ->  uso {1}%" -f (ConvertTo-GB $TotalQuotaBytes), $pct) -ForegroundColor White
     }
 
-    # Top 10 carpetas más pesadas.
-    # NOTA: estos dos "Top 10" son listas de drill-down JERÁRQUICO (informativas):
-    # muestran carpetas de cualquier profundidad (padre e hijas), por eso NO se
-    # suman ni se usan como agregado — hacerlo contaría el mismo tamaño/overhead
-    # varias veces. El agregado tenant-wide se calcula más abajo con las filas raíz.
-    Write-Host "`n--- Top 10 carpetas por tamaño total ---" -ForegroundColor Yellow
-    $Folders | Sort-Object TotalSizeBytes -Descending | Select-Object -First 10 | ForEach-Object {
-        Write-Host ("  {0,8} GB  {1}" -f (ConvertTo-GB $_.TotalSizeBytes), $_.FolderPath)
+    # Top N sitios por tamaño (antes solo estaban en sitios.csv, no en consola).
+    Write-Host "`n--- Top $TopRankings sitios por tamaño ---" -ForegroundColor Yellow
+    $Sites | Sort-Object StorageUsageCurrentBytes -Descending | Select-Object -First $TopRankings | ForEach-Object {
+        Write-Host ("  {0,10} GB  {1}  ({2})" -f (ConvertTo-GB $_.StorageUsageCurrentBytes), $_.Title, $_.Url)
     }
 
-    # Top 10 por sobrecarga de versiones.
-    Write-Host "`n--- Top 10 carpetas por VersionOverhead (versiones) ---" -ForegroundColor Yellow
-    $Folders | Sort-Object VersionOverheadBytes -Descending | Select-Object -First 10 | ForEach-Object {
-        Write-Host ("  {0,8} GB  {1}" -f (ConvertTo-GB $_.VersionOverheadBytes), $_.FolderPath)
+    # VISTA 1 — Top N carpetas por tamaño TOTAL (acumulado, incluye subcarpetas).
+    # NOTA: esta vista es un drill-down JERÁRQUICO informativo. Como las métricas son
+    # ACUMULADAS, aparece el mismo árbol a cada nivel (padre e hijas); por eso NO se
+    # suma ni se usa como agregado. El agregado tenant-wide usa las filas raíz (abajo).
+    # Ahora cada fila incluye [sitio] Biblioteca para distinguir homónimos.
+    Write-Host "`n--- Top $TopRankings carpetas por tamaño TOTAL (acumulado, incluye subcarpetas) ---" -ForegroundColor Yellow
+    $Folders | Sort-Object TotalSizeBytes -Descending | Select-Object -First $TopRankings | ForEach-Object {
+        Write-Host ("  {0,10} GB  {1}" -f (ConvertTo-GB $_.TotalSizeBytes), (Format-FolderLabel $_))
+    }
+
+    # VISTA 2 — Top N carpetas por tamaño PROPIO (exclusivo, sin subcarpetas).
+    # OwnSizeBytes = TotalSize - suma(TotalSize de hijas DIRECTAS). Ver Add-OwnFolderSize.
+    # Esta vista evita que una misma rama domine el ranking a cada nivel de anidación.
+    Write-Host "`n--- Top $TopRankings carpetas por tamaño PROPIO (exclusivo, sin subcarpetas) ---" -ForegroundColor Yellow
+    $Folders |
+        Sort-Object -Property @{ E = { if ($_.PSObject.Properties['OwnSizeBytes']) { $_.OwnSizeBytes } else { $_.TotalSizeBytes } } } -Descending |
+        Select-Object -First $TopRankings | ForEach-Object {
+            $own = if ($_.PSObject.Properties['OwnSizeBytes']) { $_.OwnSizeBytes } else { $_.TotalSizeBytes }
+            Write-Host ("  {0,10} GB  {1}" -f (ConvertTo-GB $own), (Format-FolderLabel $_))
+        }
+
+    # Top N por sobrecarga de versiones (con la misma etiqueta [sitio] Biblioteca).
+    Write-Host "`n--- Top $TopRankings carpetas por VersionOverhead (versiones) ---" -ForegroundColor Yellow
+    $Folders | Sort-Object VersionOverheadBytes -Descending | Select-Object -First $TopRankings | ForEach-Object {
+        Write-Host ("  {0,10} GB  {1}" -f (ConvertTo-GB $_.VersionOverheadBytes), (Format-FolderLabel $_))
     }
 
     # Recuperable estimado si se limitan versiones.
@@ -740,12 +1034,31 @@ function Show-Summary {
     $rootFolders = $Folders | Where-Object { $_.Depth -eq 0 }
     $recoverableBytes = ($rootFolders | Measure-Object -Property VersionOverheadBytes -Sum).Sum
     $recoverableBytes = [double]($recoverableBytes ?? 0)
-    Write-Host ("`nRecuperable estimado por versiones (carpetas relevadas): {0} GB" -f (ConvertTo-GB $recoverableBytes)) -ForegroundColor Green
+    Write-Host ("`nOverhead TOTAL de versiones (todas las edades, carpetas relevadas): {0} GB" -f (ConvertTo-GB $recoverableBytes)) -ForegroundColor Green
+
+    # Sección NUEVA: recuperable borrando versiones de más de N meses (análisis profundo).
+    # Es un LOWER BOUND: solo se analizaron a nivel archivo las Top DeepVersionTopN
+    # carpetas por overhead, y solo sus archivos inmediatos (ver Get-FolderVersionAgeBreakdown).
+    if ($VersionBreakdowns -and @($VersionBreakdowns).Count -gt 0) {
+        $recentTot      = [double](($VersionBreakdowns | Measure-Object -Property RecentVersionsBytes -Sum).Sum ?? 0)
+        $recoverTot     = [double](($VersionBreakdowns | Measure-Object -Property RecoverableVersionsBytes -Sum).Sum ?? 0)
+        $b2to6          = [double](($VersionBreakdowns | Measure-Object -Property Bucket2to6Bytes -Sum).Sum ?? 0)
+        $b6to12         = [double](($VersionBreakdowns | Measure-Object -Property Bucket6to12Bytes -Sum).Sum ?? 0)
+        $bOver12        = [double](($VersionBreakdowns | Measure-Object -Property BucketOver12Bytes -Sum).Sum ?? 0)
+        $overheadDeep   = $recentTot + $recoverTot
+        $foldersDeep    = @($VersionBreakdowns).Count
+
+        Write-Host "`n--- Recuperable borrando versiones de más de $VersionAgeMonths meses (análisis profundo) ---" -ForegroundColor Yellow
+        Write-Host ("  De los {0} GB de overhead analizado a fondo, {1} GB son versiones de más de {2} meses (recuperable según criterio)." -f (ConvertTo-GB $overheadDeep), (ConvertTo-GB $recoverTot), $VersionAgeMonths) -ForegroundColor Green
+        Write-Host ("  Desglose por antigüedad:  2-6m: {0} GB   6-12m: {1} GB   >12m: {2} GB" -f (ConvertTo-GB $b2to6), (ConvertTo-GB $b6to12), (ConvertTo-GB $bOver12))
+        Write-Host ("  Carpetas analizadas a fondo: {0}" -f $foldersDeep)
+        Write-Host "  NOTA: es un LOWER BOUND: solo se drillearon las carpetas más pesadas por overhead (archivos inmediatos)." -ForegroundColor Gray
+    }
 
     # Papeleras: total recuperable inmediato.
     $binBytes = ($Bins | Measure-Object -Property TotalBytes -Sum).Sum
     $binBytes = [double]($binBytes ?? 0)
-    Write-Host ("Recuperable en papeleras (1ra+2da etapa): {0} GB" -f (ConvertTo-GB $binBytes)) -ForegroundColor Green
+    Write-Host ("`nRecuperable en papeleras (1ra+2da etapa): {0} GB" -f (ConvertTo-GB $binBytes)) -ForegroundColor Green
 
     # Candidatos a archivar.
     $cand12 = $Candidates | Where-Object { $_.Inactive12Months }
@@ -898,11 +1211,58 @@ function Main {
     Export-LibrariesCsv -Libraries $allLibraries.ToArray() -Path $OutputPath
     Write-Log "bibliotecas.csv exportado ($($allLibraries.Count) filas)." 'OK'
 
-    Export-FoldersCsv -Folders $allFolders.ToArray() -Path $OutputPath
+    # Calcular el tamaño PROPIO (exclusivo) de cada carpeta ANTES de exportar/resumir,
+    # para que carpetas.csv (OwnSizeGB) y la vista "tamaño propio" lo tengan disponible.
+    $foldersArr = $allFolders.ToArray()
+    $foldersArr = Add-OwnFolderSize -Folders $foldersArr
+
+    Export-FoldersCsv -Folders $foldersArr -Path $OutputPath
     Write-Log "carpetas.csv exportado ($($allFolders.Count) filas)." 'OK'
 
     Export-RecycleBinCsv -Bins $allBins.ToArray() -Phls $allPhls.ToArray() -Path $OutputPath
     Write-Log "papeleras.csv exportado ($($allBins.Count) filas)." 'OK'
+
+    # 2f) Análisis PROFUNDO de antigüedad de versiones sobre las Top DeepVersionTopN
+    # carpetas por overhead. Reutiliza la conexión por sitio (una por sitio candidato).
+    $versionBreakdowns = [System.Collections.Generic.List[object]]::new()
+    $deepTargets = $foldersArr | Sort-Object VersionOverheadBytes -Descending | Select-Object -First $DeepVersionTopN
+    $deepCount = @($deepTargets).Count
+
+    if ($deepCount -gt 0) {
+        Write-Log "Iniciando análisis PROFUNDO de versiones (archivo por archivo) sobre las Top $deepCount carpetas por overhead. Esto lee el historial de versiones de cada archivo inmediato y PUEDE TARDAR MUCHO (el relevamiento de carpetas de 3 sitios ya tardó ~57 min; esto es más pesado)." 'WARN'
+
+        # Cachear conexiones por sitio para no reconectar en cada carpeta del mismo sitio.
+        $connCache = @{}
+        $di = 0
+        foreach ($folder in $deepTargets) {
+            $di++
+            $pct = [int](($di / [math]::Max($deepCount, 1)) * 100)
+            Write-Progress -Id 1 -Activity "Análisis profundo de versiones" `
+                -Status "($di/$deepCount) $($folder.SiteUrl) $($folder.FolderPath)" -PercentComplete $pct
+
+            try {
+                if (-not $connCache.ContainsKey($folder.SiteUrl)) {
+                    $connCache[$folder.SiteUrl] = Connect-SPO -Url $folder.SiteUrl -Tenant $TenantName -ClientId $ClientId
+                }
+                $fConn = $connCache[$folder.SiteUrl]
+
+                $bd = Get-FolderVersionAgeBreakdown -Connection $fConn -SiteUrl $folder.SiteUrl `
+                    -Library $folder.Library -FolderSiteRelativeUrl $folder.FolderPath `
+                    -VersionAgeMonths $VersionAgeMonths -FolderIndex $di -FolderTotal $deepCount
+
+                # Adjuntar el overhead de la métrica de carpeta para el cross-check del CSV.
+                $bd | Add-Member -NotePropertyName FolderVersionOverheadBytes -NotePropertyValue ([double]$folder.VersionOverheadBytes) -Force
+                $versionBreakdowns.Add($bd)
+            }
+            catch {
+                Write-Log "FALLÓ el análisis profundo de '$($folder.SiteUrl) $($folder.FolderPath)': $($_.Exception.Message)" 'ERROR'
+            }
+        }
+        Write-Progress -Id 1 -Activity "Análisis profundo de versiones" -Completed
+
+        Export-OldVersionsCsv -Breakdowns $versionBreakdowns.ToArray() -Path $OutputPath
+        Write-Log "versiones_antiguas.csv exportado ($($versionBreakdowns.Count) filas)." 'OK'
+    }
 
     # Candidatos a archive (sobre todos los sitios, no solo Top N). Se calcula aquí,
     # después del loop, para que los Top N ya tengan la fecha refinada por Get-PnPWeb.
@@ -911,8 +1271,10 @@ function Main {
     Write-Log "candidatos_archive.csv exportado ($($candidates.Count) candidatos)." 'OK'
 
     # 3) Resumen en consola.
-    Show-Summary -Sites $sites -Folders $allFolders.ToArray() -Candidates $candidates `
-        -Bins $allBins.ToArray() -TotalUsedBytes $totalUsedBytes -TotalQuotaBytes $totalQuotaBytes
+    Show-Summary -Sites $sites -Folders $foldersArr -Candidates $candidates `
+        -Bins $allBins.ToArray() -TotalUsedBytes $totalUsedBytes -TotalQuotaBytes $totalQuotaBytes `
+        -TopRankings $TopRankings -VersionAgeMonths $VersionAgeMonths `
+        -VersionBreakdowns $versionBreakdowns.ToArray()
 
     $swTotal.Stop()
     Write-Log ("Listo en {0:mm\:ss}. CSVs en: $OutputPath" -f $swTotal.Elapsed) 'OK'

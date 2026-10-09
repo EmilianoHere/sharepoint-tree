@@ -51,6 +51,17 @@ $SPOArgs = @{
     # se cuenta como candidato en el resumen (y en candidatos_archive.csv).
     ArchiveMonths   = 6
 
+    # ReportFormat: formato del informe final que se genera además de los CSV, en la
+    # misma carpeta de salida (nombre: informe_SPO_yyyy-MM-dd_HHmmss).
+    #   'html' -> solo escribe el .html (siempre se puede abrir e imprimir a PDF
+    #             desde el navegador).
+    #   'pdf'  -> escribe el .html y lo convierte a .pdf; si la conversión sale bien
+    #             borra el .html intermedio, pero si falla lo conserva.
+    #   'both' -> escribe el .html y además el .pdf, conservando ambos (default).
+    # La conversión a PDF detecta en runtime Chrome, Microsoft Edge, Chromium o
+    # wkhtmltopdf; si no hay NINGUNO, el informe queda como HTML (sin PDF).
+    ReportFormat    = 'both'
+
     # =========================================================================
     # Autenticación: dejar activa UNA sola opción.
     #
@@ -68,16 +79,18 @@ $SPOArgs = @{
     # el modo app-only (certificado). Interactive es el fallback.
     # =========================================================================
 
+    # (Las etiquetas Opción A/B/C coinciden con las del README, paso 2.)
+
     # ---- Opción A (RECOMENDADA): certificado por thumbprint ----
     # Descomentar y poner el thumbprint del certificado subido a la app.
     # Thumbprint = "REEMPLAZAR_THUMBPRINT"
 
-    # ---- Opción B: login interactivo (comentar las otras) ----
-    Interactive = $true
-
-    # ---- Opción C: certificado desde archivo .pfx ----
+    # ---- Opción B: certificado desde archivo .pfx (también app-only) ----
     # CertificatePath     = "./cert.pfx"
     # CertificatePassword = (Read-Host "Password del PFX" -AsSecureString)
+
+    # ---- Opción C: login interactivo (comentar las otras) ----
+    Interactive = $true
 }
 
 # Ejemplo de ejecución tras dot-sourcing este archivo:

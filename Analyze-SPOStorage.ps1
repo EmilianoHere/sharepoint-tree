@@ -66,6 +66,17 @@ param(
     # costoso/lento; por eso se limita a estas Top N carpetas por overhead.
     [int]$DeepVersionTopN = 30,
 
+    # Formato del informe final que se genera además de los CSV:
+    #   'html' -> solo escribe el .html (siempre se puede abrir e imprimir a PDF
+    #             desde el navegador).
+    #   'pdf'  -> escribe el .html y lo convierte a .pdf; si la conversión tiene
+    #             éxito borra el .html intermedio, pero si falla lo conserva.
+    #   'both' -> escribe el .html y además intenta el .pdf, conservando ambos.
+    # La conversión a PDF detecta en runtime Chrome/Edge/Chromium o wkhtmltopdf; si
+    # no hay ninguno, el informe queda como HTML (ver Export-HtmlReport).
+    [ValidateSet('html', 'pdf', 'both')]
+    [string]$ReportFormat = 'both',
+
     # --- Autenticación: elegir UNA de estas opciones ---
 
     # Login interactivo en el navegador (cómodo para una corrida puntual).
@@ -969,6 +980,86 @@ function Format-FolderLabel {
     return ("[{0}] {1}/{2}" -f $short, $Folder.Library, $path)
 }
 
+<#
+.SYNOPSIS
+    Calcula TODAS las cifras del resumen ejecutivo en un solo lugar.
+.DESCRIPTION
+    Factor común entre el resumen de consola (Show-Summary) y el informe HTML
+    (Export-HtmlReport): ambos consumen el MISMO objeto que devuelve esta función,
+    así la pantalla y el PDF/HTML coinciden exactamente (misma aritmética, mismos
+    umbrales). No recalcular estas cifras por fuera de esta función.
+
+    Devuelve un pscustomobject con todas las magnitudes en BYTES (y los costos ya
+    en USD), más los conteos. La conversión a GB se hace al presentar, con ConvertTo-GB.
+#>
+function Get-SummaryMetrics {
+    param(
+        [object[]]$Sites,
+        [object[]]$Folders,
+        [object[]]$Candidates,
+        [object[]]$Bins,
+        [double]$TotalUsedBytes,
+        [double]$TotalQuotaBytes,
+        # Antigüedad (meses) usada como criterio de "recuperable" en el análisis profundo.
+        [int]$VersionAgeMonths = 2,
+        # Desglose de antigüedad de versiones por carpeta (Get-FolderVersionAgeBreakdown).
+        [object[]]$VersionBreakdowns = @(),
+        # Umbral de inactividad (meses) para contar candidatos a archivar.
+        [int]$ArchiveMonths = 6
+    )
+
+    # Overhead TOTAL de versiones (todas las edades). Get-PnPFolderStorageMetric es
+    # AGREGADO: la carpeta raíz de cada biblioteca ya incluye el overhead de todo su
+    # árbol, por eso se suman SOLO las filas raíz (Depth=0) para evitar doble conteo.
+    $rootFolders = $Folders | Where-Object { $_.Depth -eq 0 }
+    $versionOverheadBytes = [double](($rootFolders | Measure-Object -Property VersionOverheadBytes -Sum).Sum ?? 0)
+
+    # Recuperable por antigüedad (análisis profundo). Es un LOWER BOUND: solo se
+    # drillearon las Top DeepVersionTopN carpetas por overhead (archivos inmediatos).
+    $recentTot    = [double](($VersionBreakdowns | Measure-Object -Property RecentVersionsBytes -Sum).Sum ?? 0)
+    $deepRecoverableBytes = [double](($VersionBreakdowns | Measure-Object -Property RecoverableVersionsBytes -Sum).Sum ?? 0)
+    $b2to6        = [double](($VersionBreakdowns | Measure-Object -Property Bucket2to6Bytes -Sum).Sum ?? 0)
+    $b6to12       = [double](($VersionBreakdowns | Measure-Object -Property Bucket6to12Bytes -Sum).Sum ?? 0)
+    $bOver12      = [double](($VersionBreakdowns | Measure-Object -Property BucketOver12Bytes -Sum).Sum ?? 0)
+    $deepOverheadAnalyzedBytes = $recentTot + $deepRecoverableBytes
+    $foldersDeep  = @($VersionBreakdowns).Count
+
+    # Recuperable inmediato en papeleras (1ra + 2da etapa).
+    $binBytes = [double](($Bins | Measure-Object -Property TotalBytes -Sum).Sum ?? 0)
+
+    # Candidatos a archive: sitios sin cambios en los últimos $ArchiveMonths meses.
+    $cand = $Candidates | Where-Object { $_.MonthsIdle -ge $ArchiveMonths }
+    $candBytes = [double](($cand | Measure-Object -Property StorageUsageBytes -Sum).Sum ?? 0)
+
+    # Costos comparativos (USD/mes) para el volumen candidato a archive.
+    $costArchive = [math]::Round($candBytes / $script:BytesPerGB * $script:CostArchivePerGB, 2)
+    $costExtra   = [math]::Round($candBytes / $script:BytesPerGB * $script:CostExtraStoragePerGB, 2)
+    $ahorro      = [math]::Round($costExtra - $costArchive, 2)
+
+    $usagePct = if ($TotalQuotaBytes -gt 0) { [math]::Round(($TotalUsedBytes / $TotalQuotaBytes) * 100, 1) } else { $null }
+
+    return [pscustomobject]@{
+        TotalUsedBytes            = $TotalUsedBytes
+        TotalQuotaBytes           = $TotalQuotaBytes
+        UsagePct                  = $usagePct
+        VersionOverheadBytes      = $versionOverheadBytes
+        BinBytes                  = $binBytes
+        VersionAgeMonths          = $VersionAgeMonths
+        DeepOverheadAnalyzedBytes = $deepOverheadAnalyzedBytes
+        DeepRecoverableBytes      = $deepRecoverableBytes
+        Bucket2to6Bytes           = $b2to6
+        Bucket6to12Bytes          = $b6to12
+        BucketOver12Bytes         = $bOver12
+        FoldersDeepAnalyzed       = $foldersDeep
+        ArchiveMonths             = $ArchiveMonths
+        CandidateCount            = @($cand).Count
+        CandidateBytes            = $candBytes
+        CostArchive               = $costArchive
+        CostExtra                 = $costExtra
+        Ahorro                    = $ahorro
+    }
+}
+
 function Show-Summary {
     param(
         [object[]]$Sites,
@@ -984,18 +1075,26 @@ function Show-Summary {
         # Desglose de antigüedad de versiones por carpeta (Get-FolderVersionAgeBreakdown).
         [object[]]$VersionBreakdowns = @(),
         # Umbral de inactividad (meses) para contar candidatos a archivar en el resumen.
-        [int]$ArchiveMonths = 6
+        [int]$ArchiveMonths = 6,
+        # Métricas ya calculadas por Get-SummaryMetrics (se reutilizan para que la
+        # consola y el informe HTML coincidan exactamente). Si no se pasa, se calcula.
+        [object]$Metrics = $null
     )
+
+    if (-not $Metrics) {
+        $Metrics = Get-SummaryMetrics -Sites $Sites -Folders $Folders -Candidates $Candidates `
+            -Bins $Bins -TotalUsedBytes $TotalUsedBytes -TotalQuotaBytes $TotalQuotaBytes `
+            -VersionAgeMonths $VersionAgeMonths -VersionBreakdowns $VersionBreakdowns -ArchiveMonths $ArchiveMonths
+    }
 
     $line = ('=' * 72)
     Write-Host "`n$line" -ForegroundColor Cyan
     Write-Host " RESUMEN DE ALMACENAMIENTO SHAREPOINT ONLINE" -ForegroundColor Cyan
     Write-Host $line -ForegroundColor Cyan
 
-    Write-Host ("`nUso total (sitios SPO): {0} GB" -f (ConvertTo-GB $TotalUsedBytes)) -ForegroundColor White
-    if ($TotalQuotaBytes -gt 0) {
-        $pct = [math]::Round(($TotalUsedBytes / $TotalQuotaBytes) * 100, 1)
-        Write-Host ("Cuota del pool (aprox): {0} GB  ->  uso {1}%" -f (ConvertTo-GB $TotalQuotaBytes), $pct) -ForegroundColor White
+    Write-Host ("`nUso total (sitios SPO): {0} GB" -f (ConvertTo-GB $Metrics.TotalUsedBytes)) -ForegroundColor White
+    if ($Metrics.TotalQuotaBytes -gt 0) {
+        Write-Host ("Cuota del pool (aprox): {0} GB  ->  uso {1}%" -f (ConvertTo-GB $Metrics.TotalQuotaBytes), $Metrics.UsagePct) -ForegroundColor White
     }
 
     # Top N sitios por tamaño (antes solo estaban en sitios.csv, no en consola).
@@ -1031,69 +1130,340 @@ function Show-Summary {
         Write-Host ("  {0,10} GB  {1}" -f (ConvertTo-GB $_.VersionOverheadBytes), (Format-FolderLabel $_))
     }
 
-    # Recuperable estimado si se limitan versiones.
-    # Get-PnPFolderStorageMetric devuelve métricas AGREGADAS: la carpeta raíz de
-    # cada biblioteca ya incluye el overhead de TODAS sus subcarpetas. Como el
-    # recorrido recursivo emite una fila por carpeta en cada profundidad (Depth
-    # 0..MaxDepth), sumar VersionOverheadBytes de TODAS las filas cuenta el mismo
-    # overhead en el padre y en cada hija -> doble (triple, etc.) conteo.
-    # Por eso el total tenant-wide suma SOLO las filas raíz por biblioteca
-    # (Depth -eq 0, una por par SiteUrl+Library), que ya contienen el overhead
-    # completo de su árbol. Las filas por carpeta de carpetas.csv quedan intactas
-    # (sirven para el drill-down); solo cambia este agregado del resumen.
-    $rootFolders = $Folders | Where-Object { $_.Depth -eq 0 }
-    $recoverableBytes = ($rootFolders | Measure-Object -Property VersionOverheadBytes -Sum).Sum
-    $recoverableBytes = [double]($recoverableBytes ?? 0)
-    Write-Host ("`nOverhead TOTAL de versiones (todas las edades, carpetas relevadas): {0} GB" -f (ConvertTo-GB $recoverableBytes)) -ForegroundColor Green
+    # Recuperable estimado si se limitan versiones (overhead TOTAL de todas las edades).
+    # El cálculo (solo filas raíz Depth=0, para evitar el doble conteo de las métricas
+    # AGREGADAS de Get-PnPFolderStorageMetric) vive en Get-SummaryMetrics; aquí solo se
+    # presenta la cifra ya calculada, de modo que consola e informe HTML coincidan.
+    Write-Host ("`nOverhead TOTAL de versiones (todas las edades, carpetas relevadas): {0} GB" -f (ConvertTo-GB $Metrics.VersionOverheadBytes)) -ForegroundColor Green
 
-    # Sección NUEVA: recuperable borrando versiones de más de N meses (análisis profundo).
+    # Sección: recuperable borrando versiones de más de N meses (análisis profundo).
     # Es un LOWER BOUND: solo se analizaron a nivel archivo las Top DeepVersionTopN
     # carpetas por overhead, y solo sus archivos inmediatos (ver Get-FolderVersionAgeBreakdown).
-    if ($VersionBreakdowns -and @($VersionBreakdowns).Count -gt 0) {
-        $recentTot      = [double](($VersionBreakdowns | Measure-Object -Property RecentVersionsBytes -Sum).Sum ?? 0)
-        $recoverTot     = [double](($VersionBreakdowns | Measure-Object -Property RecoverableVersionsBytes -Sum).Sum ?? 0)
-        $b2to6          = [double](($VersionBreakdowns | Measure-Object -Property Bucket2to6Bytes -Sum).Sum ?? 0)
-        $b6to12         = [double](($VersionBreakdowns | Measure-Object -Property Bucket6to12Bytes -Sum).Sum ?? 0)
-        $bOver12        = [double](($VersionBreakdowns | Measure-Object -Property BucketOver12Bytes -Sum).Sum ?? 0)
-        $overheadDeep   = $recentTot + $recoverTot
-        $foldersDeep    = @($VersionBreakdowns).Count
-
-        Write-Host "`n--- Recuperable borrando versiones de más de $VersionAgeMonths meses (análisis profundo) ---" -ForegroundColor Yellow
-        Write-Host ("  De los {0} GB de overhead analizado a fondo, {1} GB son versiones de más de {2} meses (recuperable según criterio)." -f (ConvertTo-GB $overheadDeep), (ConvertTo-GB $recoverTot), $VersionAgeMonths) -ForegroundColor Green
-        Write-Host ("  Desglose por antigüedad:  2-6m: {0} GB   6-12m: {1} GB   >12m: {2} GB" -f (ConvertTo-GB $b2to6), (ConvertTo-GB $b6to12), (ConvertTo-GB $bOver12))
-        Write-Host ("  Carpetas analizadas a fondo: {0}" -f $foldersDeep)
+    if ($Metrics.FoldersDeepAnalyzed -gt 0) {
+        Write-Host "`n--- Recuperable borrando versiones de más de $($Metrics.VersionAgeMonths) meses (análisis profundo) ---" -ForegroundColor Yellow
+        Write-Host ("  De los {0} GB de overhead analizado a fondo, {1} GB son versiones de más de {2} meses (recuperable según criterio)." -f (ConvertTo-GB $Metrics.DeepOverheadAnalyzedBytes), (ConvertTo-GB $Metrics.DeepRecoverableBytes), $Metrics.VersionAgeMonths) -ForegroundColor Green
+        Write-Host ("  Desglose por antigüedad:  2-6m: {0} GB   6-12m: {1} GB   >12m: {2} GB" -f (ConvertTo-GB $Metrics.Bucket2to6Bytes), (ConvertTo-GB $Metrics.Bucket6to12Bytes), (ConvertTo-GB $Metrics.BucketOver12Bytes))
+        Write-Host ("  Carpetas analizadas a fondo: {0}" -f $Metrics.FoldersDeepAnalyzed)
         Write-Host "  NOTA: es un LOWER BOUND: solo se drillearon las carpetas más pesadas por overhead (archivos inmediatos)." -ForegroundColor Gray
     }
 
     # Papeleras: total recuperable inmediato.
-    $binBytes = ($Bins | Measure-Object -Property TotalBytes -Sum).Sum
-    $binBytes = [double]($binBytes ?? 0)
-    Write-Host ("`nRecuperable en papeleras (1ra+2da etapa): {0} GB" -f (ConvertTo-GB $binBytes)) -ForegroundColor Green
+    Write-Host ("`nRecuperable en papeleras (1ra+2da etapa): {0} GB" -f (ConvertTo-GB $Metrics.BinBytes)) -ForegroundColor Green
 
     # Candidatos a archivar: sitios sin cambios en los últimos $ArchiveMonths meses.
-    # Filtramos por MonthsIdle (numérico) para soportar cualquier umbral configurable.
-    $cand = $Candidates | Where-Object { $_.MonthsIdle -ge $ArchiveMonths }
-    $candBytes = ($cand | Measure-Object -Property StorageUsageBytes -Sum).Sum
-    $candBytes = [double]($candBytes ?? 0)
-    $candGB = ConvertTo-GB $candBytes
+    Write-Host ("`n--- Candidatos a Microsoft 365 Archive (sin cambios {0}+ meses) ---" -f $Metrics.ArchiveMonths) -ForegroundColor Yellow
+    Write-Host ("  Sitios candidatos: {0}" -f $Metrics.CandidateCount)
+    Write-Host ("  Tamaño total candidato: {0} GB" -f (ConvertTo-GB $Metrics.CandidateBytes))
 
-    Write-Host ("`n--- Candidatos a Microsoft 365 Archive (sin cambios {0}+ meses) ---" -f $ArchiveMonths) -ForegroundColor Yellow
-    Write-Host ("  Sitios candidatos: {0}" -f @($cand).Count)
-    Write-Host ("  Tamaño total candidato: {0} GB" -f $candGB)
-
-    # Costos comparativos.
-    $costArchive = [math]::Round($candBytes / $script:BytesPerGB * $script:CostArchivePerGB, 2)
-    $costExtra   = [math]::Round($candBytes / $script:BytesPerGB * $script:CostExtraStoragePerGB, 2)
-    $ahorro      = [math]::Round($costExtra - $costArchive, 2)
-
+    # Costos comparativos (calculados en Get-SummaryMetrics).
     Write-Host "`n--- Costo mensual estimado para ese volumen ---" -ForegroundColor Yellow
     # En strings con comillas dobles se escapa el $ con backtick-dólar (`$) para
     # que imprima "US$" literal y no intente expandir una variable.
-    Write-Host ("  Microsoft 365 Archive (US`$0.05/GB): US`$ {0}" -f $costArchive)
-    Write-Host ("  Extra File Storage   (US`$0.20/GB): US`$ {0}" -f $costExtra)
-    Write-Host ("  Ahorro mensual archivando en vez de comprar: US`$ {0}" -f $ahorro) -ForegroundColor Green
+    Write-Host ("  Microsoft 365 Archive (US`$0.05/GB): US`$ {0}" -f $Metrics.CostArchive)
+    Write-Host ("  Extra File Storage   (US`$0.20/GB): US`$ {0}" -f $Metrics.CostExtra)
+    Write-Host ("  Ahorro mensual archivando en vez de comprar: US`$ {0}" -f $Metrics.Ahorro) -ForegroundColor Green
 
     Write-Host "`n$line`n" -ForegroundColor Cyan
+}
+
+# ---------------------------------------------------------------------------
+# Informe HTML (auto-convertido a PDF si hay un conversor disponible)
+# ---------------------------------------------------------------------------
+
+# Escapa un valor dinámico para incrustarlo en HTML de forma segura.
+# Usamos [System.Net.WebUtility]::HtmlEncode (parte de la BCL de .NET, siempre
+# disponible en PowerShell 7; confirmado en pwsh-preview con PnP.PowerShell 3.4.1)
+# para que caracteres como & < > " y acentos no rompan el documento.
+function ConvertTo-HtmlSafe {
+    param([object]$Value)
+    if ($null -eq $Value) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+}
+
+<#
+.SYNOPSIS
+    Intenta convertir un archivo HTML a PDF con el primer conversor disponible.
+.DESCRIPTION
+    Detecta en RUNTIME, en orden de prioridad: Chrome headless, Microsoft Edge,
+    Chromium (todos vía la misma CLI de Chromium) y, por último, wkhtmltopdf en el
+    PATH. Chrome/Edge/Chromium headless necesitan rutas ABSOLUTAS y una URL file://.
+    Una falla de conversión NO corta la corrida: se loguea WARN y se conserva el HTML.
+    Devuelve $true si generó el PDF, $false si no.
+#>
+function Convert-HtmlToPdf {
+    param(
+        [Parameter(Mandatory = $true)][string]$HtmlPath,
+        [Parameter(Mandatory = $true)][string]$PdfPath
+    )
+
+    # Rutas absolutas obligatorias para los navegadores headless.
+    $absHtml = (Resolve-Path $HtmlPath).Path
+    $fileUrl = ([System.Uri]$absHtml).AbsoluteUri  # file:///...
+
+    # Candidatos tipo Chromium (misma línea de comando). Se prueba el primero que exista.
+    $chromiumCandidates = @(
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
+    )
+
+    foreach ($exe in $chromiumCandidates) {
+        if (-not (Test-Path $exe)) { continue }
+
+        # Primer intento: con --no-pdf-header-footer (saca el encabezado/pie del navegador).
+        try {
+            & $exe --headless --disable-gpu --no-pdf-header-footer "--print-to-pdf=$PdfPath" $fileUrl 2>$null
+            if (Test-Path $PdfPath) {
+                Write-Log "PDF generado con '$exe': $PdfPath" 'OK'
+                return $true
+            }
+        }
+        catch {
+            Write-Log "Conversor '$exe' falló con --no-pdf-header-footer: $($_.Exception.Message). Reintentando sin ese flag..." 'WARN'
+        }
+
+        # Fallback: algunas versiones de Chrome rechazan --no-pdf-header-footer.
+        try {
+            & $exe --headless --disable-gpu "--print-to-pdf=$PdfPath" $fileUrl 2>$null
+            if (Test-Path $PdfPath) {
+                Write-Log "PDF generado con '$exe' (sin --no-pdf-header-footer): $PdfPath" 'OK'
+                return $true
+            }
+        }
+        catch {
+            Write-Log "Conversor '$exe' falló también sin el flag: $($_.Exception.Message)." 'WARN'
+        }
+    }
+
+    # Último recurso: wkhtmltopdf si está en el PATH.
+    $wk = Get-Command wkhtmltopdf -ErrorAction SilentlyContinue
+    if ($wk) {
+        try {
+            & $wk.Source $absHtml $PdfPath 2>$null
+            if (Test-Path $PdfPath) {
+                Write-Log "PDF generado con wkhtmltopdf: $PdfPath" 'OK'
+                return $true
+            }
+        }
+        catch {
+            Write-Log "wkhtmltopdf falló: $($_.Exception.Message)." 'WARN'
+        }
+    }
+
+    return $false
+}
+
+<#
+.SYNOPSIS
+    Genera un informe HTML autocontenido (y lo convierte a PDF si se puede).
+.DESCRIPTION
+    Documento HTML con CSS embebido (sin assets externos ni scripts: renderiza
+    offline y se puede imprimir). Reutiliza las MISMAS cifras que Show-Summary a
+    través de Get-SummaryMetrics (pasadas en -Metrics) para que el informe y la
+    consola coincidan exactamente. Todos los valores dinámicos (títulos, URLs,
+    rutas de carpeta) se escapan con ConvertTo-HtmlSafe.
+
+    Nombre de archivo con timestamp en formato año-mes-día_hora pedido por el
+    usuario: informe_SPO_yyyy-MM-dd_HHmmss (.html / .pdf), escrito en $OutputPath.
+
+    Según $Format:
+      'html' -> solo HTML.
+      'both' -> HTML + intento de PDF, conservando ambos.
+      'pdf'  -> HTML + intento de PDF; si el PDF sale, borra el HTML intermedio;
+                si falla, conserva el HTML.
+#>
+function Export-HtmlReport {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][object]$Metrics,
+        [object[]]$Sites = @(),
+        [object[]]$Folders = @(),
+        [object[]]$VersionBreakdowns = @(),
+        [string]$TenantName = '',
+        [int]$TopRankings = 30,
+        [ValidateSet('html', 'pdf', 'both')]
+        [string]$Format = 'both'
+    )
+
+    # Timestamp humano (es-AR) para el encabezado y timestamp de archivo (año-mes-día_hora).
+    $esAR = [System.Globalization.CultureInfo]::GetCultureInfo('es-AR')
+    $now  = Get-Date
+    $stampHuman = $now.ToString('dddd d \d\e MMMM \d\e yyyy, HH:mm:ss', $esAR)
+    $stampFile  = $now.ToString('yyyy-MM-dd_HHmmss')
+
+    $baseName = "informe_SPO_$stampFile"
+    $htmlPath = Join-Path $Path "$baseName.html"
+    $pdfPath  = Join-Path $Path "$baseName.pdf"
+
+    # Helper local: fila de tabla con una etiqueta ya escapada y un valor numérico GB.
+    # (Se arman strings; no se ejecuta nada del contenido dinámico.)
+
+    $tenantSafe = ConvertTo-HtmlSafe $TenantName
+
+    # --- Resumen ejecutivo: cifras desde $Metrics (mismas que la consola) ---
+    $usoTotalGB      = ConvertTo-GB $Metrics.TotalUsedBytes
+    $papelerasGB     = ConvertTo-GB $Metrics.BinBytes
+    $overheadGB      = ConvertTo-GB $Metrics.VersionOverheadBytes
+    $deepRecGB       = ConvertTo-GB $Metrics.DeepRecoverableBytes
+    $b2to6GB         = ConvertTo-GB $Metrics.Bucket2to6Bytes
+    $b6to12GB        = ConvertTo-GB $Metrics.Bucket6to12Bytes
+    $bOver12GB       = ConvertTo-GB $Metrics.BucketOver12Bytes
+    $candGB          = ConvertTo-GB $Metrics.CandidateBytes
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine('<!DOCTYPE html>')
+    [void]$sb.AppendLine('<html lang="es">')
+    [void]$sb.AppendLine('<head>')
+    [void]$sb.AppendLine('<meta charset="utf-8">')
+    [void]$sb.AppendLine('<meta name="viewport" content="width=device-width, initial-scale=1">')
+    [void]$sb.AppendLine('<title>Informe de almacenamiento SharePoint Online</title>')
+    [void]$sb.AppendLine('<style>')
+    [void]$sb.AppendLine(@'
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", Arial, sans-serif; color: #1b1b1b; margin: 24px; font-size: 14px; }
+  h1 { font-size: 24px; margin: 0 0 4px 0; color: #0f3d5c; }
+  h2 { font-size: 18px; margin: 28px 0 10px 0; color: #0f3d5c; border-bottom: 2px solid #d0dce5; padding-bottom: 4px; }
+  .meta { color: #555; font-size: 13px; margin-bottom: 16px; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 16px 0; }
+  th, td { border: 1px solid #cfd8dd; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #eef3f6; }
+  td.num, th.num { text-align: right; white-space: nowrap; }
+  tr:nth-child(even) td { background: #f8fafb; }
+  .cards { display: flex; flex-wrap: wrap; gap: 12px; margin: 8px 0 8px 0; }
+  .card { border: 1px solid #cfd8dd; border-radius: 8px; padding: 12px 16px; min-width: 200px; flex: 1 1 200px; background: #f8fafb; }
+  .card .label { font-size: 12px; color: #555; text-transform: uppercase; letter-spacing: .03em; }
+  .card .value { font-size: 28px; font-weight: 700; color: #0f3d5c; margin-top: 4px; }
+  .card.highlight { background: #e9f7ef; border-color: #a6d9bb; }
+  .card.highlight .value { color: #176b3a; }
+  .buckets { font-size: 12px; color: #555; margin-top: 6px; }
+  .footer { margin-top: 28px; font-size: 12px; color: #666; border-top: 1px solid #d0dce5; padding-top: 10px; }
+  .ro { font-weight: 700; color: #176b3a; }
+'@)
+    [void]$sb.AppendLine('</style>')
+    [void]$sb.AppendLine('</head>')
+    [void]$sb.AppendLine('<body>')
+
+    # --- Título + timestamp + tenant ---
+    [void]$sb.AppendLine('<h1>Informe de almacenamiento de SharePoint Online</h1>')
+    [void]$sb.AppendLine(('<div class="meta">Generado el {0}{1}</div>' -f (ConvertTo-HtmlSafe $stampHuman), $(if ($tenantSafe) { " &middot; Tenant: <strong>$tenantSafe</strong>" } else { '' })))
+
+    # --- Resumen ejecutivo ---
+    [void]$sb.AppendLine('<h2>Resumen ejecutivo</h2>')
+    [void]$sb.AppendLine('<div class="cards">')
+    [void]$sb.AppendLine(('<div class="card"><div class="label">Uso total (sitios SPO)</div><div class="value">{0} GB</div></div>' -f $usoTotalGB))
+    [void]$sb.AppendLine(('<div class="card highlight"><div class="label">Recuperable en papeleras</div><div class="value">{0} GB</div></div>' -f $papelerasGB))
+    [void]$sb.AppendLine(('<div class="card"><div class="label">Overhead total de versiones (todas las edades)</div><div class="value">{0} GB</div></div>' -f $overheadGB))
+    [void]$sb.AppendLine(('<div class="card highlight"><div class="label">Recuperable borrando versiones &gt; {0} meses</div><div class="value">{1} GB</div><div class="buckets">2-6m: {2} GB &middot; 6-12m: {3} GB &middot; &gt;12m: {4} GB</div></div>' -f $Metrics.VersionAgeMonths, $deepRecGB, $b2to6GB, $b6to12GB, $bOver12GB))
+    [void]$sb.AppendLine(('<div class="card"><div class="label">Candidatos a Archive (&ge; {0} meses sin cambios)</div><div class="value">{1}</div><div class="buckets">{2} GB en total</div></div>' -f $Metrics.ArchiveMonths, $Metrics.CandidateCount, $candGB))
+    [void]$sb.AppendLine('</div>')
+
+    # Tabla de costos comparativos.
+    [void]$sb.AppendLine('<table>')
+    [void]$sb.AppendLine('<tr><th>Opción de costo (para el volumen candidato)</th><th class="num">USD / mes</th></tr>')
+    [void]$sb.AppendLine(('<tr><td>Microsoft 365 Archive (US$0.05/GB)</td><td class="num">US$ {0}</td></tr>' -f $Metrics.CostArchive))
+    [void]$sb.AppendLine(('<tr><td>Office 365 Extra File Storage (US$0.20/GB)</td><td class="num">US$ {0}</td></tr>' -f $Metrics.CostExtra))
+    [void]$sb.AppendLine(('<tr><td><strong>Ahorro mensual archivando en vez de comprar storage</strong></td><td class="num"><strong>US$ {0}</strong></td></tr>' -f $Metrics.Ahorro))
+    [void]$sb.AppendLine('</table>')
+
+    # --- Top N sitios por tamaño ---
+    [void]$sb.AppendLine(('<h2>Top {0} sitios por tamaño</h2>' -f $TopRankings))
+    [void]$sb.AppendLine('<table>')
+    [void]$sb.AppendLine('<tr><th>Título</th><th>URL</th><th class="num">GB</th></tr>')
+    $topSites = $Sites | Sort-Object StorageUsageCurrentBytes -Descending | Select-Object -First $TopRankings
+    foreach ($s in $topSites) {
+        [void]$sb.AppendLine(('<tr><td>{0}</td><td>{1}</td><td class="num">{2}</td></tr>' -f (ConvertTo-HtmlSafe $s.Title), (ConvertTo-HtmlSafe $s.Url), (ConvertTo-GB $s.StorageUsageCurrentBytes)))
+    }
+    [void]$sb.AppendLine('</table>')
+
+    # --- Top N carpetas por tamaño TOTAL (acumulado) ---
+    [void]$sb.AppendLine(('<h2>Top {0} carpetas por tamaño TOTAL (acumulado)</h2>' -f $TopRankings))
+    [void]$sb.AppendLine('<table>')
+    [void]$sb.AppendLine('<tr><th>Carpeta</th><th class="num">GB</th></tr>')
+    $topTotal = $Folders | Sort-Object TotalSizeBytes -Descending | Select-Object -First $TopRankings
+    foreach ($f in $topTotal) {
+        [void]$sb.AppendLine(('<tr><td>{0}</td><td class="num">{1}</td></tr>' -f (ConvertTo-HtmlSafe (Format-FolderLabel $f)), (ConvertTo-GB $f.TotalSizeBytes)))
+    }
+    [void]$sb.AppendLine('</table>')
+
+    # --- Top N carpetas por tamaño PROPIO (exclusivo) ---
+    [void]$sb.AppendLine(('<h2>Top {0} carpetas por tamaño PROPIO (exclusivo)</h2>' -f $TopRankings))
+    [void]$sb.AppendLine('<table>')
+    [void]$sb.AppendLine('<tr><th>Carpeta</th><th class="num">GB</th></tr>')
+    $topOwn = $Folders |
+        Sort-Object -Property @{ E = { if ($_.PSObject.Properties['OwnSizeBytes']) { $_.OwnSizeBytes } else { $_.TotalSizeBytes } } } -Descending |
+        Select-Object -First $TopRankings
+    foreach ($f in $topOwn) {
+        $own = if ($f.PSObject.Properties['OwnSizeBytes']) { $f.OwnSizeBytes } else { $f.TotalSizeBytes }
+        [void]$sb.AppendLine(('<tr><td>{0}</td><td class="num">{1}</td></tr>' -f (ConvertTo-HtmlSafe (Format-FolderLabel $f)), (ConvertTo-GB $own)))
+    }
+    [void]$sb.AppendLine('</table>')
+
+    # --- Top N carpetas por VersionOverhead ---
+    [void]$sb.AppendLine(('<h2>Top {0} carpetas por VersionOverhead (versiones)</h2>' -f $TopRankings))
+    [void]$sb.AppendLine('<table>')
+    [void]$sb.AppendLine('<tr><th>Carpeta</th><th class="num">GB</th></tr>')
+    $topOverhead = $Folders | Sort-Object VersionOverheadBytes -Descending | Select-Object -First $TopRankings
+    foreach ($f in $topOverhead) {
+        [void]$sb.AppendLine(('<tr><td>{0}</td><td class="num">{1}</td></tr>' -f (ConvertTo-HtmlSafe (Format-FolderLabel $f)), (ConvertTo-GB $f.VersionOverheadBytes)))
+    }
+    [void]$sb.AppendLine('</table>')
+
+    # --- Versiones recuperables (>N meses) por carpeta ---
+    [void]$sb.AppendLine(('<h2>Versiones recuperables (&gt; {0} meses) por carpeta</h2>' -f $Metrics.VersionAgeMonths))
+    [void]$sb.AppendLine('<table>')
+    [void]$sb.AppendLine('<tr><th>Carpeta</th><th class="num">Archivos analizados</th><th class="num">Recuperable GB</th><th class="num">2-6m</th><th class="num">6-12m</th><th class="num">&gt;12m</th></tr>')
+    $vb = $VersionBreakdowns | Sort-Object RecoverableVersionsBytes -Descending
+    foreach ($b in $vb) {
+        $label = Format-FolderLabel ([pscustomobject]@{ SiteUrl = $b.SiteUrl; Library = $b.Library; FolderPath = $b.FolderPath })
+        [void]$sb.AppendLine(('<tr><td>{0}</td><td class="num">{1}</td><td class="num">{2}</td><td class="num">{3}</td><td class="num">{4}</td><td class="num">{5}</td></tr>' -f `
+            (ConvertTo-HtmlSafe $label), $b.FilesAnalyzed, (ConvertTo-GB $b.RecoverableVersionsBytes), `
+            (ConvertTo-GB $b.Bucket2to6Bytes), (ConvertTo-GB $b.Bucket6to12Bytes), (ConvertTo-GB $b.BucketOver12Bytes)))
+    }
+    [void]$sb.AppendLine('</table>')
+
+    # --- Footer ---
+    [void]$sb.AppendLine('<div class="footer">')
+    [void]$sb.AppendLine(('<p>La cifra de versiones recuperables es un <strong>LOWER BOUND</strong>: solo se analizaron a fondo las carpetas más pesadas por overhead (Top {0}), y solo sus archivos inmediatos.</p>' -f $Metrics.FoldersDeepAnalyzed))
+    [void]$sb.AppendLine('<p class="ro">Herramienta de SOLO LECTURA: este informe solo reporta; no borra, mueve ni modifica nada en el tenant.</p>')
+    [void]$sb.AppendLine('</div>')
+
+    [void]$sb.AppendLine('</body>')
+    [void]$sb.AppendLine('</html>')
+
+    # Escribir el HTML (UTF-8).
+    $sb.ToString() | Out-File -FilePath $htmlPath -Encoding utf8
+    Write-Log "Informe HTML generado: $htmlPath" 'OK'
+
+    # Si no se pide PDF, terminamos: el HTML es el entregable garantizado.
+    if ($Format -eq 'html') {
+        return
+    }
+
+    # Intentar la conversión a PDF (best-effort). Una falla NO corta la corrida.
+    $pdfOk = $false
+    try {
+        $pdfOk = Convert-HtmlToPdf -HtmlPath $htmlPath -PdfPath $pdfPath
+    }
+    catch {
+        Write-Log "La conversión a PDF falló inesperadamente: $($_.Exception.Message). Queda el HTML." 'WARN'
+        $pdfOk = $false
+    }
+
+    if (-not $pdfOk) {
+        Write-Log "No se encontró conversor a PDF (Chrome/Edge/Chromium/wkhtmltopdf). El informe queda como HTML (se puede abrir e imprimir a PDF desde el navegador)." 'WARN'
+        return
+    }
+
+    # Modo 'pdf': borrar el HTML intermedio SOLO si el PDF se generó bien.
+    if ($Format -eq 'pdf') {
+        try {
+            Remove-Item -Path $htmlPath -Force
+            Write-Log "Modo 'pdf': HTML intermedio eliminado tras la conversión exitosa." 'INFO'
+        }
+        catch {
+            Write-Log "No se pudo borrar el HTML intermedio '$htmlPath': $($_.Exception.Message). Se conserva." 'WARN'
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1281,11 +1651,24 @@ function Main {
     Export-ArchiveCandidatesCsv -Candidates $candidates -Path $OutputPath
     Write-Log "candidatos_archive.csv exportado ($($candidates.Count) candidatos)." 'OK'
 
+    # Calcular las métricas del resumen UNA sola vez y compartirlas entre la consola
+    # (Show-Summary) y el informe HTML (Export-HtmlReport), así ambos coinciden exacto.
+    $breakdownsArr = $versionBreakdowns.ToArray()
+    $binsArr = $allBins.ToArray()
+    $metrics = Get-SummaryMetrics -Sites $sites -Folders $foldersArr -Candidates $candidates `
+        -Bins $binsArr -TotalUsedBytes $totalUsedBytes -TotalQuotaBytes $totalQuotaBytes `
+        -VersionAgeMonths $VersionAgeMonths -VersionBreakdowns $breakdownsArr -ArchiveMonths $ArchiveMonths
+
     # 3) Resumen en consola.
     Show-Summary -Sites $sites -Folders $foldersArr -Candidates $candidates `
-        -Bins $allBins.ToArray() -TotalUsedBytes $totalUsedBytes -TotalQuotaBytes $totalQuotaBytes `
+        -Bins $binsArr -TotalUsedBytes $totalUsedBytes -TotalQuotaBytes $totalQuotaBytes `
         -TopRankings $TopRankings -VersionAgeMonths $VersionAgeMonths `
-        -VersionBreakdowns $versionBreakdowns.ToArray() -ArchiveMonths $ArchiveMonths
+        -VersionBreakdowns $breakdownsArr -ArchiveMonths $ArchiveMonths -Metrics $metrics
+
+    # 4) Informe HTML (y PDF si hay conversor). Se genera DESPUÉS de los CSV y del
+    # resumen de consola, para que la pantalla siga mostrando todo igual que antes.
+    Export-HtmlReport -Path $OutputPath -Metrics $metrics -Sites $sites -Folders $foldersArr `
+        -VersionBreakdowns $breakdownsArr -TenantName $TenantName -TopRankings $TopRankings -Format $ReportFormat
 
     $swTotal.Stop()
     Write-Log ("Listo en {0:mm\:ss}. CSVs en: $OutputPath" -f $swTotal.Elapsed) 'OK'

@@ -53,14 +53,15 @@ $SPOArgs = @{
 
     # ReportFormat: formato del informe final que se genera además de los CSV, en la
     # misma carpeta de salida (nombre: informe_SPO_yyyy-MM-dd_HHmmss).
-    #   'html' -> solo escribe el .html (siempre se puede abrir e imprimir a PDF
-    #             desde el navegador).
+    #   'html' -> solo escribe el .html (RECOMENDADO y default). Para obtener un PDF,
+    #             abrí el HTML en el navegador y usá Cmd+P -> Guardar como PDF.
     #   'pdf'  -> escribe el .html y lo convierte a .pdf; si la conversión sale bien
     #             borra el .html intermedio, pero si falla lo conserva.
-    #   'both' -> escribe el .html y además el .pdf, conservando ambos (default).
-    # La conversión a PDF detecta en runtime Chrome, Microsoft Edge, Chromium o
-    # wkhtmltopdf; si no hay NINGUNO, el informe queda como HTML (sin PDF).
-    ReportFormat    = 'both'
+    #   'both' -> escribe el .html y además intenta el .pdf, conservando ambos.
+    # NOTA: la conversión automática a PDF usa Chrome headless y en macOS puede ser
+    # inestable si Chrome está abierto (a veces imprime la pestaña activa). Por eso el
+    # default es 'html'; el HTML se convierte a PDF perfecto con Cmd+P.
+    ReportFormat    = 'html'
 
     # =========================================================================
     # Autenticación: dejar activa UNA sola opción.

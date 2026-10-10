@@ -67,15 +67,17 @@ param(
     [int]$DeepVersionTopN = 30,
 
     # Formato del informe final que se genera además de los CSV:
-    #   'html' -> solo escribe el .html (siempre se puede abrir e imprimir a PDF
-    #             desde el navegador).
+    #   'html' -> solo escribe el .html (RECOMENDADO). Se abre en cualquier
+    #             navegador y se imprime a PDF con Cmd+P -> Guardar como PDF.
     #   'pdf'  -> escribe el .html y lo convierte a .pdf; si la conversión tiene
     #             éxito borra el .html intermedio, pero si falla lo conserva.
     #   'both' -> escribe el .html y además intenta el .pdf, conservando ambos.
-    # La conversión a PDF detecta en runtime Chrome/Edge/Chromium o wkhtmltopdf; si
-    # no hay ninguno, el informe queda como HTML (ver Export-HtmlReport).
+    # NOTA: la conversión automática a PDF usa Chrome headless y en macOS puede
+    # ser inestable si Chrome está abierto (a veces imprime la pestaña activa en
+    # vez del informe). Por eso el default es 'html': el HTML es el entregable
+    # confiable y se convierte a PDF perfecto con Cmd+P desde el navegador.
     [ValidateSet('html', 'pdf', 'both')]
-    [string]$ReportFormat = 'both',
+    [string]$ReportFormat = 'html',
 
     # --- Autenticación: elegir UNA de estas opciones ---
 
@@ -1207,31 +1209,106 @@ function Convert-HtmlToPdf {
         '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
     )
 
-    foreach ($exe in $chromiumCandidates) {
-        if (-not (Test-Path $exe)) { continue }
+    # Perfil temporal AISLADO: imprescindible para que Chrome NO reutilice una
+    # instancia ya abierta del navegador. Sin esto, si el usuario tiene Chrome
+    # abierto, headless se engancha a esa sesión e imprime la pestaña activa
+    # (la página de inicio de Google) en vez de nuestro file://. (Bug observado.)
+    $tmpProfile = Join-Path ([System.IO.Path]::GetTempPath()) ("spo-chrome-" + [guid]::NewGuid().ToString('N'))
 
-        # Primer intento: con --no-pdf-header-footer (saca el encabezado/pie del navegador).
-        try {
-            & $exe --headless --disable-gpu --no-pdf-header-footer "--print-to-pdf=$PdfPath" $fileUrl 2>$null
-            if (Test-Path $PdfPath) {
-                Write-Log "PDF generado con '$exe': $PdfPath" 'OK'
-                return $true
+    # Verifica que el PDF exista y NO esté vacío (0 bytes = conversión fallida).
+    $pdfValido = {
+        param($p)
+        (Test-Path $p) -and ((Get-Item $p).Length -gt 0)
+    }
+
+    # Ejecuta el navegador headless con un límite de tiempo. En macOS, Chrome
+    # headless a veces no cierra su proceso solo tras escribir el PDF; el PDF
+    # igual queda bien escrito, así que esperamos a que aparezca el archivo y,
+    # pasado el timeout, matamos el proceso para no colgar el script.
+    $runHeadless = {
+        # OJO: el parámetro NO puede llamarse $Args (colisiona con la variable
+        # automática $args de PowerShell y rompe el binding posicional). Usamos $ChromeArgs.
+        param([string]$Exe, [string[]]$ChromeArgs, [string]$OutPdf, [int]$TimeoutSec = 60)
+        if (Test-Path $OutPdf) { Remove-Item $OutPdf -Force -ErrorAction SilentlyContinue }
+        # Nota: -WindowStyle no está soportado por Start-Process en PowerShell en
+        # macOS/Linux. Chrome escribe mucho ruido por stderr; lo mandamos a archivos
+        # temporales DISTINTOS (Start-Process no admite el mismo destino para ambos).
+        $outLog = Join-Path ([System.IO.Path]::GetTempPath()) ("spo-chrome-out-" + [guid]::NewGuid().ToString('N') + '.log')
+        $errLog = Join-Path ([System.IO.Path]::GetTempPath()) ("spo-chrome-err-" + [guid]::NewGuid().ToString('N') + '.log')
+        $p = Start-Process -FilePath $Exe -ArgumentList $ChromeArgs -PassThru `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+        # IMPORTANTE: esperar a que Chrome TERMINE solo (no matarlo apenas aparece
+        # el archivo). Chrome escribe primero un PDF parcial y recién al final el
+        # contenido correcto; si lo matábamos a los 500 ms, el PDF salía incompleto
+        # o con la pestaña equivocada. Usamos WaitForExit con timeout de respaldo.
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            try { $p.Kill() } catch { }
+        }
+        # Limpiar los logs temporales de Chrome.
+        foreach ($lg in @($outLog, $errLog)) {
+            if ($lg -and (Test-Path $lg)) { Remove-Item $lg -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    try {
+        foreach ($exe in $chromiumCandidates) {
+            if (-not (Test-Path $exe)) { continue }
+
+            # Modo headless "old": IMPRESCINDIBLE en macOS. El "--headless" moderno
+            # (= --headless=new) se CONECTA a una instancia de Chrome ya abierta por
+            # el usuario e imprime su pestaña activa (la página de inicio de Google)
+            # en vez de nuestro file://. "--headless=old" fuerza el headless clásico
+            # aislado, que junto al --user-data-dir temporal garantiza que imprima
+            # nuestro HTML. (Bug reproducido y verificado con Chrome abierto.)
+            $argsClasico = @(
+                '--headless=old'
+                '--disable-gpu'
+                "--user-data-dir=$tmpProfile"
+                '--no-first-run'
+                '--no-default-browser-check'
+                '--disable-extensions'
+                '--no-pdf-header-footer'
+                "--print-to-pdf=$PdfPath"
+                $fileUrl
+            )
+            try {
+                & $runHeadless $exe $argsClasico $PdfPath 60
+                if (& $pdfValido $PdfPath) {
+                    Write-Log "PDF generado con '$exe': $PdfPath" 'OK'
+                    return $true
+                }
+            }
+            catch {
+                Write-Log "Conversor '$exe' (headless clásico) falló: $($_.Exception.Message). Reintentando sin --no-pdf-header-footer..." 'WARN'
+            }
+
+            # Fallback: algunas versiones rechazan --no-pdf-header-footer.
+            $argsSinFlag = @(
+                '--headless=old'
+                '--disable-gpu'
+                "--user-data-dir=$tmpProfile"
+                '--no-first-run'
+                '--no-default-browser-check'
+                '--disable-extensions'
+                "--print-to-pdf=$PdfPath"
+                $fileUrl
+            )
+            try {
+                & $runHeadless $exe $argsSinFlag $PdfPath 60
+                if (& $pdfValido $PdfPath) {
+                    Write-Log "PDF generado con '$exe' (sin --no-pdf-header-footer): $PdfPath" 'OK'
+                    return $true
+                }
+            }
+            catch {
+                Write-Log "Conversor '$exe' falló también sin el flag: $($_.Exception.Message)." 'WARN'
             }
         }
-        catch {
-            Write-Log "Conversor '$exe' falló con --no-pdf-header-footer: $($_.Exception.Message). Reintentando sin ese flag..." 'WARN'
-        }
-
-        # Fallback: algunas versiones de Chrome rechazan --no-pdf-header-footer.
-        try {
-            & $exe --headless --disable-gpu "--print-to-pdf=$PdfPath" $fileUrl 2>$null
-            if (Test-Path $PdfPath) {
-                Write-Log "PDF generado con '$exe' (sin --no-pdf-header-footer): $PdfPath" 'OK'
-                return $true
-            }
-        }
-        catch {
-            Write-Log "Conversor '$exe' falló también sin el flag: $($_.Exception.Message)." 'WARN'
+    }
+    finally {
+        # Limpiar el perfil temporal de Chrome.
+        if (Test-Path $tmpProfile) {
+            Remove-Item $tmpProfile -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
@@ -1324,6 +1401,7 @@ function Export-HtmlReport {
   h1 { font-size: 24px; margin: 0 0 4px 0; color: #0f3d5c; }
   h2 { font-size: 18px; margin: 28px 0 10px 0; color: #0f3d5c; border-bottom: 2px solid #d0dce5; padding-bottom: 4px; }
   .meta { color: #555; font-size: 13px; margin-bottom: 16px; }
+  .desc { color: #555; font-size: 12.5px; margin: 0 0 10px 0; font-style: italic; }
   table { border-collapse: collapse; width: 100%; margin: 8px 0 16px 0; }
   th, td { border: 1px solid #cfd8dd; padding: 6px 8px; text-align: left; vertical-align: top; }
   th { background: #eef3f6; }
@@ -1349,6 +1427,7 @@ function Export-HtmlReport {
 
     # --- Resumen ejecutivo ---
     [void]$sb.AppendLine('<h2>Resumen ejecutivo</h2>')
+    [void]$sb.AppendLine('<p class="desc">Cifras clave del tenant: cuánto espacio se usa en total y cuánto se podría recuperar sin comprar más almacenamiento (vaciando papeleras y limpiando versiones antiguas), más una comparación de costos entre archivar y comprar storage extra.</p>')
     [void]$sb.AppendLine('<div class="cards">')
     [void]$sb.AppendLine(('<div class="card"><div class="label">Uso total (sitios SPO)</div><div class="value">{0} GB</div></div>' -f $usoTotalGB))
     [void]$sb.AppendLine(('<div class="card highlight"><div class="label">Recuperable en papeleras</div><div class="value">{0} GB</div></div>' -f $papelerasGB))
@@ -1367,6 +1446,7 @@ function Export-HtmlReport {
 
     # --- Top N sitios por tamaño ---
     [void]$sb.AppendLine(('<h2>Top {0} sitios por tamaño</h2>' -f $TopRankings))
+    [void]$sb.AppendLine(('<p class="desc">Los {0} sitios de SharePoint que más espacio ocupan, de mayor a menor. Cada "sitio" es un espacio de trabajo (por equipo o área). Muestra a nivel general dónde está repartido el almacenamiento del tenant.</p>' -f $TopRankings))
     [void]$sb.AppendLine('<table>')
     [void]$sb.AppendLine('<tr><th>Título</th><th>URL</th><th class="num">GB</th></tr>')
     $topSites = $Sites | Sort-Object StorageUsageCurrentBytes -Descending | Select-Object -First $TopRankings
@@ -1377,6 +1457,7 @@ function Export-HtmlReport {
 
     # --- Top N carpetas por tamaño TOTAL (acumulado) ---
     [void]$sb.AppendLine(('<h2>Top {0} carpetas por tamaño TOTAL (acumulado)</h2>' -f $TopRankings))
+    [void]$sb.AppendLine('<p class="desc">Carpetas más pesadas contando TODO lo que hay dentro, incluidas sus subcarpetas. Como una carpeta incluye a sus hijas, acá verás la misma rama repetida a distintos niveles (ej. una carpeta y su subcarpeta). Sirve para ver qué rama completa pesa más. El prefijo [sitio] indica a qué sitio pertenece cada carpeta.</p>')
     [void]$sb.AppendLine('<table>')
     [void]$sb.AppendLine('<tr><th>Carpeta</th><th class="num">GB</th></tr>')
     $topTotal = $Folders | Sort-Object TotalSizeBytes -Descending | Select-Object -First $TopRankings
@@ -1387,6 +1468,7 @@ function Export-HtmlReport {
 
     # --- Top N carpetas por tamaño PROPIO (exclusivo) ---
     [void]$sb.AppendLine(('<h2>Top {0} carpetas por tamaño PROPIO (exclusivo)</h2>' -f $TopRankings))
+    [void]$sb.AppendLine('<p class="desc">Carpetas más pesadas contando SOLO los archivos que están directamente en ellas, sin sumar sus subcarpetas. Esta vista muestra en qué carpeta puntual vive el peso de verdad (no una rama entera), así es la más útil para decidir dónde actuar.</p>')
     [void]$sb.AppendLine('<table>')
     [void]$sb.AppendLine('<tr><th>Carpeta</th><th class="num">GB</th></tr>')
     $topOwn = $Folders |
@@ -1400,6 +1482,7 @@ function Export-HtmlReport {
 
     # --- Top N carpetas por VersionOverhead ---
     [void]$sb.AppendLine(('<h2>Top {0} carpetas por VersionOverhead (versiones)</h2>' -f $TopRankings))
+    [void]$sb.AppendLine('<p class="desc">Carpetas donde más espacio ocupan las VERSIONES anteriores de los archivos (el historial que SharePoint guarda en cada edición). VersionOverhead = tamaño total de la carpeta menos el de la versión actual, es decir, lo que ocupan las copias viejas. Un overhead alto indica una buena candidata para limpiar versiones.</p>')
     [void]$sb.AppendLine('<table>')
     [void]$sb.AppendLine('<tr><th>Carpeta</th><th class="num">GB</th></tr>')
     $topOverhead = $Folders | Sort-Object VersionOverheadBytes -Descending | Select-Object -First $TopRankings
@@ -1410,6 +1493,7 @@ function Export-HtmlReport {
 
     # --- Versiones recuperables (>N meses) por carpeta ---
     [void]$sb.AppendLine(('<h2>Versiones recuperables (&gt; {0} meses) por carpeta</h2>' -f $Metrics.VersionAgeMonths))
+    [void]$sb.AppendLine(('<p class="desc">Análisis fino (archivo por archivo) sobre las carpetas de mayor overhead: cuánto de las versiones antiguas tiene más de {0} meses, es decir, lo que podrías borrar según tu criterio. Las columnas 2-6m / 6-12m / &gt;12m reparten ese espacio por antigüedad. "Archivos analizados" es cuántos archivos inmediatos se revisaron en esa carpeta.</p>' -f $Metrics.VersionAgeMonths))
     [void]$sb.AppendLine('<table>')
     [void]$sb.AppendLine('<tr><th>Carpeta</th><th class="num">Archivos analizados</th><th class="num">Recuperable GB</th><th class="num">2-6m</th><th class="num">6-12m</th><th class="num">&gt;12m</th></tr>')
     $vb = $VersionBreakdowns | Sort-Object RecoverableVersionsBytes -Descending
@@ -1436,6 +1520,7 @@ function Export-HtmlReport {
 
     # Si no se pide PDF, terminamos: el HTML es el entregable garantizado.
     if ($Format -eq 'html') {
+        Write-Log "Para obtener un PDF: abrí el HTML en el navegador y usá Cmd+P -> Guardar como PDF." 'INFO'
         return
     }
 
@@ -1450,7 +1535,8 @@ function Export-HtmlReport {
     }
 
     if (-not $pdfOk) {
-        Write-Log "No se encontró conversor a PDF (Chrome/Edge/Chromium/wkhtmltopdf). El informe queda como HTML (se puede abrir e imprimir a PDF desde el navegador)." 'WARN'
+        Write-Log "No se pudo generar el PDF automáticamente. El informe queda como HTML." 'WARN'
+        Write-Log "Para el PDF: abrí '$htmlPath' en el navegador y usá Cmd+P -> Guardar como PDF (sale idéntico y es 100% confiable)." 'INFO'
         return
     }
 

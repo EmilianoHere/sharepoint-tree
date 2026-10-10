@@ -182,7 +182,7 @@ tiene acceso y es lento. No recomendado para auditar todo el tenant (ver tabla a
 | `-TopRankings` | `30` | Cantidad de filas a mostrar en los rankings de **consola** (sitios y carpetas). No afecta los CSV, que siempre llevan todas las filas. |
 | `-VersionAgeMonths` | `2` | Antigüedad (meses) a partir de la cual una versión histórica se considera **recuperable**. Las más nuevas no se cuentan como ahorro. |
 | `-DeepVersionTopN` | `30` | Cantidad de carpetas (las de mayor overhead) sobre las que se corre el **análisis profundo** de antigüedad de versiones (archivo por archivo). **Es lento** (ver notas). |
-| `-ReportFormat` | `both` | Formato del **informe** final (además de los CSV): `html` (solo HTML), `pdf` (HTML + PDF; borra el HTML si el PDF sale bien) o `both` (HTML + PDF, conserva ambos). Ver "Informe HTML / PDF" abajo. |
+| `-ReportFormat` | `html` | Formato del **informe** final (además de los CSV): `html` (solo HTML, recomendado), `pdf` (intenta HTML + PDF; borra el HTML si el PDF sale bien) o `both` (HTML + intento de PDF, conserva ambos). Ver "Informe HTML / PDF" abajo. |
 | `-Interactive` | — | Login interactivo en navegador. |
 | `-Thumbprint` | — | Thumbprint del certificado instalado. |
 | `-CertificatePath` | — | Ruta a un `.pfx`. |
@@ -231,29 +231,34 @@ carpeta `-OutputPath`, con **fecha y hora en el nombre** en formato **año-mes-d
 
 ```
 informe_SPO_yyyy-MM-dd_HHmmss.html   (p. ej. informe_SPO_2026-10-09_174233.html)
-informe_SPO_yyyy-MM-dd_HHmmss.pdf
 ```
 
 El HTML es **autocontenido** (CSS embebido, sin assets externos ni scripts): se abre
-offline en cualquier navegador y se puede imprimir. Incluye un **resumen ejecutivo** con
-las mismas cifras que la consola (uso total, recuperable en papeleras, overhead de
-versiones, recuperable por versiones de más de `VersionAgeMonths` meses con su desglose
-2-6m / 6-12m / >12m, candidatos a archive y la comparación de costos Archive vs Extra
-Storage) y las tablas de Top `TopRankings` sitios y carpetas (tamaño total, tamaño propio,
-version overhead) y de versiones recuperables por carpeta.
+offline en cualquier navegador y se puede imprimir. Cada sección lleva una breve
+**descripción** de qué significa. Incluye un **resumen ejecutivo** con las mismas cifras
+que la consola (uso total, recuperable en papeleras, overhead de versiones, recuperable
+por versiones de más de `VersionAgeMonths` meses con su desglose 2-6m / 6-12m / >12m,
+candidatos a archive y la comparación de costos Archive vs Extra Storage) y las tablas de
+Top `TopRankings` sitios y carpetas (tamaño total, tamaño propio, version overhead) y de
+versiones recuperables por carpeta.
 
-El parámetro **`-ReportFormat`** (default `both`) controla el formato:
+### Cómo obtener el PDF
 
-- `html` — solo el `.html`.
-- `pdf` — `.html` + `.pdf`; si el PDF se genera bien, borra el `.html` intermedio (si la
-  conversión falla, conserva el `.html`).
-- `both` — `.html` + `.pdf`, conservando ambos.
+El entregable confiable es el **HTML**. Para convertirlo a PDF, abrilo en el navegador y
+usá **Cmd+P → Guardar como PDF**: sale idéntico y es 100% confiable.
 
-La **conversión a PDF** se intenta en runtime detectando, en orden: **Google Chrome**,
-**Microsoft Edge**, **Chromium** (todos headless) y, por último, **wkhtmltopdf** en el
-`PATH`. Si **no hay ninguno**, el informe queda como **HTML** (que igual se imprime a PDF
-desde el navegador) y el script lo avisa con un WARN. Una falla de conversión **nunca**
-corta la corrida: el HTML es el entregable garantizado.
+El parámetro **`-ReportFormat`** (default `html`) controla el formato:
+
+- `html` — solo el `.html` (**recomendado**).
+- `pdf` — intenta `.html` + `.pdf`; si el PDF se genera bien, borra el `.html` intermedio
+  (si la conversión falla, conserva el `.html`).
+- `both` — `.html` + intento de `.pdf`, conservando ambos.
+
+> **Sobre la conversión automática a PDF:** se intenta con **Chrome / Edge / Chromium**
+> headless (o `wkhtmltopdf` si está en el `PATH`). En **macOS es inestable si Chrome está
+> abierto**: a veces imprime la pestaña activa del navegador en vez del informe. Por eso
+> el default es `html` y se recomienda el Cmd+P. Una falla de conversión **nunca** corta
+> la corrida: el HTML siempre queda generado.
 
 > El informe, como el resto del script, es de **solo lectura**: reporta, no borra nada.
 
